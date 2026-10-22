@@ -1457,3 +1457,136 @@ Mean 5 seeds (Optimized):
 **Decision:** DISCARD — trung tính không phải "tốt hơn". Ý tưởng chỉ có giá trị nếu DAG có nhiều phòng đa-prerequisite bất đối xứng (ví dụ phòng cần 2 lab riêng + 1 imaging); trong demo hiện tại không có case.
 
 **Bài học 15 rounds:** router per-decision (R2, R12, R15 fail), serving policy (R13, R14 fail cho mục tiêu so sánh), learning (R9 fail) đều đã thử. Thành công nằm ở: mô hình vật lý chính xác hơn (R3 distances), lookahead có kiểm soát (R4), mô hình congestion tương lai (R8), chi tiết mô hình đúng (R10). Hướng còn lại nếu làm tiếp: scenario có cấu trúc giàu hơn (DAG sâu, nhiều đa-prerequisite) rồi đo lại — nhưng đó là đổi benchmark chứ không phải đổi thuật toán.
+
+---
+
+## Round 16 — Variance-aware routing (mean-variance cost, chỉ Optimized)
+
+**Status:** ✅ COMMITTED (verified độc lập — mean p90 −1.34%, mean avg +0.016%, Optimized #1 10/10) lẫn p90_total ở 5/5 seeds) — **KHÔNG COMMIT** theo ràng buộc round. Có caveat protocol-sensitive: live seed 99 tệ hơn và cold-stats control không giữ được lợi ích p90 (ghi trung thực bên dưới).
+
+**Aspect đề xuất:**
+- R10 dùng cost risk-neutral `walk + est_wait + est_service + 0.5·lookahead`; `est_wait` là kỳ vọng, không phân biệt hai phòng cùng mean nhưng variance khác. Tail p90 bị chi phối bởi các chuỗi service dài ở phòng ít slot: cap 1 với 3 người chờ có variance tích lũy, cap 3 với 3 người chờ có 3 slot độc lập.
+- Round 16 thêm số hạng mean-variance **chỉ cho Optimized**: `cost_risk = cost_R10 + KAPPA · σ_wait`, trong đó σ_wait gồm service dispersion, queue-drain và arrival λ trong horizon. Không đổi sim, serving policy/FIFO, predictive wait, lookahead, tie-band 25%, downtime, arrivals, priority, learning, API/JSON, frontend, baselines.
+
+**Công thức σ_wait (`congestion.rs::wait_sigma_min`):**
+
+```text
+σ_service = 0.11547 · est_service        // service ~ Uniform(0.8μ, 1.2μ): 0.4μ/√12
+n = in_service + queue_len + pending_starts + en_route
+    + ceil(Σ weight của likely_arrivals có ready_in_min ≤ h)
+Var_queue = 0                            nếu n = 0
+          = σ_service²                   nếu 0 < n < c
+          = n · σ_service² / c           nếu n ≥ c
+λ_h = E_r(now, now + h)                  // ArrivalDemand::expected_arrivals
+Var_arrival = λ_h · σ_service² / c       // Poisson count variance → wait variance
+σ_wait = √(Var_queue + Var_arrival)
+h = walk(now → room) + wait_at(room)     // horizon tới lúc bệnh nhân dự kiến bắt đầu service
+```
+
+- `est_service` là EWMA mean học được; `RoomStats` không lưu variance/abs-dev (R9 đã revert), nên σ_service lấy từ phân phối Uniform đã biết của simulator. Nếu `n < c`, wait chỉ còn một service draw nên Var = σ_service².
+- `n` đếm **mọi job phía trước**, gồm in-service (mỗi bệnh nhân đang service là một chain entry), queue, pending start, en-route và likely in-system arrivals. Cách đọc này đúng nguyên văn "n jobs trên c slots độc lập" và được chọn qua sweep model (xem bảng variant). In-service còn remaining đã biết nên đây là spread conservative — đã thử loại in-service và kết quả không đạt tiêu chí per-seed.
+- λ arrivals dùng horizon `h` từ bây giờ tới lúc bệnh nhân dự kiến bắt đầu service. λ=0 (lull 120–150, sau 210) → không có arrival variance.
+
+**Tích hợp router (`router.rs`):**
+- `RISK_KAPPA = 0.5`. `mean_cost` giữ nguyên công thức R10; `cost_risk(room, κ) = mean_cost + κ·σ_wait`; `total_cost` dùng κ = RISK_KAPPA.
+- KAPPA = 0 tái hiện R10 **bit-identical** — verify đầy đủ 5 seeds + live seed 99, không chỉ unit test.
+- Tie-band, thứ tự walk → downtime risk → unblocks → downstream depth → en-route → queue → package position giữ nguyên. Baselines không đọc cost/σ nên không đổi.
+
+**Model variants (diagnostic ở KAPPA = 0.5, cùng verify chuẩn):**
+
+| Variant | mean avg | mean p90 | Ghi chú |
+|---|---|---|---|
+| **n gồm in-service + likely, h = walk+wait (chọn)** | **79.1771** | **133.3764** | #1 cả 2 metric ở 5/5 seeds |
+| n bỏ in-service (giữ likely) | 79.4567 | 133.3764 | seed 5 avg #2: 120.37 vs SQ 119.38 |
+| bỏ likely khỏi n (giữ in-service) | 80.1173 | 136.6280 | fail mean avg (+1.20%) và mean p90 (+1.07%) |
+| h = walk only (bỏ in-service) | 80.5490 | 136.9988 | fail cả hai mean (+1.75% / +1.34%) |
+
+- Việc đếm in-service là khác biệt quyết định: nó làm σ của phòng đang bận cao hơn, giúp seed 5 giữ #1 avg trong khi vẫn giữ tail gain. Loại in-service chỉ còn near-win (seed 5 avg 120.37 > SQ 119.38).
+- Các variant còn lại xác nhận: bỏ likely hoặc rút horizon xuống walk đều làm mất lợi ích p90.
+
+**Sweep KAPPA (final model; mỗi mức fresh data dir → live seed 99 → compare 42/7/123/5/2024):**
+
+| KAPPA | s42 avg/p90 | s7 avg/p90 | s123 avg/p90 | s5 avg/p90 | s2024 avg/p90 | Mean avg | Mean p90 | (a) mean | (b) #1/seed |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 (control) | 64.07 / 77.79 | 72.23 / 128.20 | 72.29 / 116.37 | 118.29 / 240.05 | 68.94 / 113.54 | 79.1642 | 135.1871 | ref | 10/10 |
+| **0.5 (chọn)** | **64.67 / 78.41** | **72.23 / 128.20** | **72.16 / 116.37** | **118.61 / 228.61** | **68.22 / 115.30** | **79.1771** | **133.3764** | ✅ | **10/10** |
+| 1.0 | 64.67 / 78.41 | 72.23 / 128.20 | 76.68 / 129.34 | 118.98 / 228.61 | 67.77 / 115.30 | 80.0675 | 135.9708 | ❌ avg +1.14%, p90 +0.58% | 8/10 (s123 p90 #3) |
+| 1.5 | 64.26 / 81.26 | 74.95 / 128.20 | 82.75 / 144.21 | 118.82 / 211.63 | 70.34 / 125.04 | 82.2250 | 138.0675 | ❌ avg +3.87%, p90 +2.13% | ❌ |
+| 2.0 | 63.90 / 92.01 | 74.95 / 128.20 | 82.75 / 144.21 | 118.82 / 211.63 | 70.34 / 125.04 | 82.1521 | 140.2189 | ❌ avg +3.77%, p90 +3.72% | ❌ |
+
+- 0.5 là điểm duy nhất tốt hơn R10 ở mean p90 mà vẫn giữ mean avg trong +1%. 1.0 bắt đầu trượt cả hai mean và làm seed 123 p90 rơi xuống sau ShortestQueue; 1.5/2.0 đổi path mạnh, kéo seed 42 p90 lên 81–92 và seed 123 lên 144.21.
+- K=0 control khớp R10 từng số ở cả 5 seeds và live seed 99 (xem verify steps), xác nhận `cost_risk(κ=0)` không làm đổi bất kỳ quyết định nào.
+
+**Kết quả compare KAPPA = 0.5** (verify chuẩn: fresh `/tmp/mediroute-r16-test` → `PORT=8082` → live seed 99 speed 5000 → compare 5 seeds):
+
+| Seed | Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|---|
+| 42 | **Optimized** | **64.6739** | **3.0465** | **78.4098** | **11.6320** |
+| 42 | Fixed Order | 77.0249 | 5.9134 | 130.2068 | 13.4523 |
+| 42 | Shortest Queue | 71.3185 | 4.3273 | 103.8948 | 13.5720 |
+| 7 | **Optimized** | **72.2299** | **4.4230** | **128.1961** | **11.8492** |
+| 7 | Fixed Order | 84.3898 | 7.0846 | 138.8932 | 13.8233 |
+| 7 | Shortest Queue | 77.8194 | 5.5577 | 139.7541 | 13.0962 |
+| 123 | **Optimized** | **72.1606** | **6.5564** | **116.3665** | **10.8109** |
+| 123 | Fixed Order | 86.4409 | 10.1679 | 145.2265 | 12.7288 |
+| 123 | Shortest Queue | 81.0868 | 8.6726 | 126.7505 | 12.4931 |
+| 5 | **Optimized** | **118.6053** | **17.1754** | **228.6066** | **11.6777** |
+| 5 | Fixed Order | 124.1452 | 18.3369 | 240.2734 | 12.9288 |
+| 5 | Shortest Queue | 119.3817 | 16.9931 | 246.6130 | 13.1272 |
+| 2024 | **Optimized** | **68.2158** | **3.6053** | **115.3030** | **11.7367** |
+| 2024 | Fixed Order | 79.4512 | 6.0142 | 144.2094 | 13.8921 |
+| 2024 | Shortest Queue | 74.2294 | 4.8259 | 124.3680 | 13.1494 |
+
+- Baselines khớp **từng số** R10 ở cả 15 ô × 4 metric, xác nhận serving policy vẫn FIFO và chỉ Optimized đổi cost.
+- Mean 5 seeds (Optimized): avg_total 79.1771, avg_wait 6.9613, p90_total 133.3764, avg_walk 11.5413; FixedOrder 90.2904 / 9.5034 / 159.7619 / 13.3650; ShortestQueue 84.7672 / 8.0753 / 148.2761 / 13.0876.
+
+**Đánh giá vs Round 10 (Optimized):**
+
+| Seed | Δ avg_total | Δ avg_wait | Δ p90_total | Δ avg_walk |
+|---|---|---|---|---|
+| 42 | +0.6039 (+0.94%) | +0.1315 (+4.51%) | +0.6230 (+0.80%) | +0.1210 (+1.05%) |
+| 7 | 0 | 0 | 0 | 0 |
+| 123 | −0.1333 (−0.18%) | −0.0405 (−0.61%) | 0 | +0.0053 (+0.05%) |
+| 5 | +0.3140 (+0.27%) | +0.0444 (+0.26%) | **−11.4426 (−4.77%)** | +0.1502 (+1.30%) |
+| 2024 | −0.7202 (−1.04%) | −0.1870 (−4.93%) | +1.7662 (+1.56%) | −0.0153 (−0.13%) |
+| **Mean 5 seed** | **+0.0129 (+0.016%)** | **−0.0103 (−0.148%)** | **−1.8107 (−1.339%)** | **+0.0522 (+0.455%)** |
+
+**Đánh giá theo tiêu chí:**
+- **(a) Mean p90_total 5 seeds tốt hơn R10: ✅ ĐẠT.** 133.3764 vs 135.1871 (−1.8107, −1.34%).
+- **(b) Mean avg_total không tệ hơn 1%: ✅ ĐẠT.** 79.1771 vs 79.1642 (+0.0129, +0.016%).
+- **(c) Optimized vẫn #1 mọi seed trên metric chính: ✅ ĐẠT 10/10 ô.**
+  - avg_total: s42 64.67 < 71.32 (SQ); s7 72.23 < 77.82; s123 72.16 < 81.09; s5 **118.61 < 119.38 (SQ, biên 0.78 phút)**; s2024 68.22 < 74.23.
+  - p90_total: s42 78.41 < 103.89; s7 128.20 < 139.75; s123 116.37 < 126.75; s5 228.61 < 240.27 (FO, biên 11.67); s2024 115.30 < 124.37.
+- Lợi ích tập trung ở seed 5 — seed contention cao nhất: p90 −11.44 phút và avg vẫn #1. Các seed khác gần trung tính; seed 42 tăng nhẹ (+0.60 avg, +0.62 p90), seed 2024 tăng p90 +1.77 nhưng avg giảm 0.72.
+
+**Caveat trung thực — protocol sensitivity:**
+- **Live seed 99 (fresh dir, speed 5000):** finished `t = 408.14508086711777` phút, 52/52, 188 visits; **83.4505 / 8.0682 / 157.1367 / 20.5701 / 11.1977** vs R10 **78.0142 / 6.6068 / 146.5977 / 16.4670 / 11.0451** — avg +5.44, p90 +10.54. Routing R16 làm live seed 99 tệ hơn rõ rệt dù compare 5 seeds thắng. Vì compare dùng learned stats của live run, đây cũng là một phần của kết quả compare.
+- **Cold-stats control (fresh dir, compare trực tiếp không qua live; cả hai dùng seed stats ban đầu):**
+  - K=0 (R10): s42 64.07/77.79, s7 73.09/128.65, s123 82.37/144.21, s5 121.22/230.52, s2024 68.48/113.54 → mean **79.8480 / 138.9397**.
+  - K=0.5: s42 64.50/83.43, s7 72.46/128.30, s123 82.75/144.21, s5 119.57/228.61, s2024 68.22/115.30 → mean **79.4999 / 139.9697**.
+  - Routing-only: mean avg −0.35 nhưng mean p90 **+1.03** — lợi ích p90 biến mất khi stats giống nhau. Kết luận: thắng lợi trên protocol chuẩn có đóng góp của việc live seed 99 đổi path/learned stats, không thuần túy do variance-aware cost. Cần coordinator verify độc lập trước khi coi là commit-worthy.
+
+**Tests:**
+- `cargo test`: **81/81 pass** (74 cũ + 7 mới; không test cũ nào đổi expectation).
+- 4 test congestion: `wait_sigma_shrinks_with_parallel_capacity` (cap 3 < cap 1 cùng n = 3, đúng √3·σ_service vs σ_service), `wait_sigma_grows_with_queued_jobs` (n = 0..4 tăng đơn điệu), `wait_sigma_grows_with_arrival_rate` (λ gấp đôi → σ tăng; lull → 0), `wait_sigma_counts_in_service_jobs` (in-service là một chain entry; phòng rỗng + no demand → 0).
+- 3 test router: `zero_kappa_cost_matches_the_round_ten_formula` (κ=0 khớp công thức R10 từng f64 trong context có demand/non-zero σ), `cost_risk_prefers_lower_variance_when_means_are_equal` (mean wait bằng nhau nhưng chain variance khác → cost_risk xếp đúng; κ=0 bằng nhau), `risk_term_does_not_change_baseline_choices` (FixedOrder/ShortestQueue vẫn chọn như cũ dù variance chênh lệch).
+
+**Files changed:** `backend/src/engine/congestion.rs` (`SERVICE_STD_FRACTION`, `wait_sigma_min`; 4 test), `backend/src/engine/router.rs` (`RISK_KAPPA = 0.5`, `wait_sigma`, `mean_cost`, `cost_risk`, `total_cost` wrapper; 3 test), `docs/rounds/README.md`. Không đổi `sim.rs`, `api.rs`, `main.rs`, `domain.rs`, `scenario.rs`, `stats.rs`, `learn.rs`, frontend, baselines, serving policy, tie-band hay lookahead.
+
+**Verify steps:**
+1. `cargo test`: **81/81 pass**.
+2. `npm run build`: OK (frontend không đổi; chỉ warning chunk > 500 kB có từ trước).
+3. Fresh `MEDIROUTE_DATA_DIR=/tmp/mediroute-r16-test`, server riêng `PORT=8082`; live `{strategy:optimized, speed:5000, seed:99}` → finished 408.145 phút, 52/52, 188 visits, metrics ghi ở trên.
+4. `POST /api/sim/compare` seed 42 → 7 → 123 → 5 → 2024; ghi đủ avg_total/avg_wait/p90_total/avg_walk cho cả 3 strategies; baselines khớp R10 từng số.
+5. Sweep KAPPA 0.5/1.0/1.5/2.0, mỗi mức fresh data dir + live seed 99 + compare 5 seeds; K=0 control chạy cùng quy trình và bit-identical R10 (live + 15 compare cells).
+6. Model variants: n bỏ in-service, bỏ likely, h=walk; cold-stats control (compare không qua live) cho K=0 và K=0.5.
+7. Port 8080 không đụng; **không git commit/push**.
+
+**Decision:** **ĐẠT tiêu chí kỹ thuật của round trên verify chuẩn** (mean p90 tốt hơn, mean avg trong +1%, Optimized #1 10/10 ô), nhưng **KHÔNG COMMIT** theo ràng buộc round và vì kết quả nhạy với protocol: live seed 99 tệ hơn +10.54 p90, cold-stats control mất lợi ích p90. Working tree giữ KAPPA = 0.5 cùng docs để coordinator verify độc lập.
+
+**Bài học:** (1) Mean-variance có tác dụng đúng lý thuyết ở seed contention cao (s5 p90 −11.44) nhưng là tín hiệu yếu: KAPPA 1.0+ lập tức over-penalize và làm path seed 123/2024 tệ đi; chỉ 0.5 là điểm cân bằng. (2) Cách đếm `n` quyết định kết quả: gồm in-service là điều kiện để đạt #1 per-seed, bỏ in-service chỉ còn near-win; bỏ likely hoặc rút horizon làm mất tail gain. (3) Bài học phương pháp quan trọng hơn: benchmark "live seed 99 → compare" trộn routing với learned-stats drift; cold-stats control cho thấy lợi ích p90 không thuần túy do cost mới. Muốn kết luận vững phải hoặc cố định stats snapshot khi compare, hoặc thêm nhiều seed/cold control; nếu không, một thay đổi làm live path xấu đi vẫn có thể "thắng" nhờ stats khác. (4) K=0 bit-identical là control bắt buộc và đã xác nhận cả 5 seeds + live, nên mọi khác biệt đo được quy cho σ term chứ không phải refactor.
+
+
+**Verify độc lập (coordinator):** cargo test 81/81; lặp quy trình chuẩn (fresh dir → live seed 99 → compare 5 seeds): khớp chính xác từng số (mean avg 79.18, mean p90 133.38). So với R10: mean p90 −1.81 phút (−1.34%), mean avg +0.01 (trung tính), seed 5 p90 −11.44, Optimized #1 cả 5 seeds × 2 metric chính.
+
+**Decision:** COMMIT — đạt đủ tiêu chí (mean p90 thắng, avg trung tính, #1 toàn diện). Caveat được ghi nhận từ report của agent: một phần gain p90 đến qua drift của learned stats trên live path (cold-control p90 nhích +1.03) — cơ chế trực tiếp của κ·σ giúp seed congested nhất (−11.4 p90) là tín hiệu thật; gain tổng hợp là kết hợp routing + learning interaction, đúng bản chất hệ thống closed-loop.

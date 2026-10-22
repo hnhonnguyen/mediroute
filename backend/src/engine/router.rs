@@ -20,6 +20,12 @@ const COST_TIE_BAND: f64 = 0.25;
 /// next room dominate the immediate wait. Tuned on seeds 42/7/123.
 const LOOKAHEAD_WEIGHT: f64 = 0.5;
 
+/// Round 16 prices wait variance on top of the expected cost:
+/// `cost = walk + wait + service + 0.5 * lookahead + KAPPA * sigma_wait`.
+/// KAPPA = 0 reproduces Round 10 exactly. The five-seed sweep picked 0.5:
+/// higher values regressed both mean metrics and lost per-seed wins.
+const RISK_KAPPA: f64 = 0.5;
+
 // Round 10 keeps outage risk as a late tie-break: the demo policy allows at
 // most one outage per room, so a room that has already started its outage is
 // risk-free for the rest of the run. Pricing the risk directly into the cost
@@ -289,10 +295,45 @@ impl RouteContext<'_> {
         required: &HashSet<&str>,
         done: &HashSet<&str>,
     ) -> f64 {
+        self.cost_risk(room, required, done, RISK_KAPPA)
+    }
+
+    /// Mean cost of this choice: walk + predicted wait + service plus the
+    /// half-weighted follow-up.
+    fn mean_cost(&self, room: &str, required: &HashSet<&str>, done: &HashSet<&str>) -> f64 {
         self.walk_to(room)
             + self.wait_at(room)
             + self.est_service(room)
             + LOOKAHEAD_WEIGHT * self.lookahead_cost(room, required, done)
+    }
+
+    /// Mean-variance cost used by the risk-averse Optimized router. `kappa`
+    /// is exposed so tests can verify that zero reproduces the Round 10 cost
+    /// and that a positive value penalizes a higher-variance wait.
+    fn cost_risk(
+        &self,
+        room: &str,
+        required: &HashSet<&str>,
+        done: &HashSet<&str>,
+        kappa: f64,
+    ) -> f64 {
+        self.mean_cost(room, required, done) + kappa * self.wait_sigma(room)
+    }
+
+    /// Standard deviation of the wait at `room`, using the queue drain and
+    /// arrival components from `congestion::wait_sigma_min`. The horizon runs
+    /// from now until the patient is projected to start service.
+    fn wait_sigma(&self, room: &str) -> f64 {
+        let horizon = self.walk_to(room) + self.wait_at(room);
+        congestion::wait_sigma_min(
+            &self.load(room),
+            self.est_service(room),
+            self.capacity(room),
+            self.demand,
+            room,
+            self.now_min,
+            horizon,
+        )
     }
 
     fn unblocks(&self, room: &str, required: &HashSet<&str>, done: &HashSet<&str>) -> usize {
@@ -1244,6 +1285,104 @@ mod tests {
         assert_eq!(
             ctx.next_room(Strategy::ShortestQueue, &required, &[]),
             Some("down".to_string())
+        );
+    }
+
+    #[test]
+    fn zero_kappa_cost_matches_the_round_ten_formula() {
+        let demand = ArrivalDemand::from_scenario(&demo_scenario(), 52);
+        let rooms = vec![
+            room_at("a", 10.0, 1, (0.0, 0.0)),
+            room_at("b", 12.0, 2, (5.0, 0.0)),
+        ];
+        let graph = graph(&rooms, &[]);
+        let stats = stats(&rooms, &[]);
+        let room_loads = loads(&[("a", 2, 0, 0, 0), ("b", 0, 0, 0, 0)]);
+        let ctx = RouteContext {
+            rooms: &rooms,
+            graph: &graph,
+            stats: &stats,
+            loads: &room_loads,
+            current_location: ENTRANCE_ID,
+            demand: Some(&demand),
+            now_min: 30.0,
+        };
+        let required = vec!["a".to_string(), "b".to_string()];
+        let required_set: HashSet<&str> = required.iter().map(String::as_str).collect();
+        let done_set = HashSet::new();
+
+        assert!(ctx.wait_sigma("a") > 0.0, "the control context must carry variance");
+        for id in ["a", "b"] {
+            let r10 = ctx.walk_to(id)
+                + ctx.wait_at(id)
+                + ctx.est_service(id)
+                + LOOKAHEAD_WEIGHT * ctx.lookahead_cost(id, &required_set, &done_set);
+            assert_eq!(ctx.cost_risk(id, &required_set, &done_set, 0.0), r10);
+            assert_eq!(ctx.mean_cost(id, &required_set, &done_set), r10);
+        }
+    }
+
+    #[test]
+    fn cost_risk_prefers_lower_variance_when_means_are_equal() {
+        // Both rooms project a 20-minute wait at the same distance. "steady"
+        // has one in-service patient; "risky" runs two stations behind two
+        // in-service patients plus three queued jobs, so its chain carries
+        // more service-draw variance even though the mean wait matches.
+        let rooms = vec![
+            room_at("steady", 10.0, 1, (10.0, 0.0)),
+            room_at("risky", 10.0, 2, (10.0, 0.0)),
+        ];
+        let graph = graph(&rooms, &[]);
+        let stats = stats(&rooms, &[]);
+        let mut room_loads = loads(&[("steady", 0, 1, 0, 0), ("risky", 3, 2, 0, 0)]);
+        room_loads
+            .get_mut("steady")
+            .expect("steady load")
+            .in_service_remaining = vec![20.0];
+        room_loads
+            .get_mut("risky")
+            .expect("risky load")
+            .in_service_remaining = vec![10.0, 0.0];
+        let ctx = cost_context(&rooms, &graph, &stats, &room_loads, 20.0);
+        let required = vec!["steady".to_string(), "risky".to_string()];
+        let required_set: HashSet<&str> = required.iter().map(String::as_str).collect();
+        let done_set = HashSet::new();
+
+        let mean_steady = ctx.mean_cost("steady", &required_set, &done_set);
+        let mean_risky = ctx.mean_cost("risky", &required_set, &done_set);
+        assert!((mean_steady - mean_risky).abs() < 1e-9);
+        assert!(ctx.wait_sigma("steady") < ctx.wait_sigma("risky"));
+        assert!(
+            ctx.cost_risk("steady", &required_set, &done_set, 1.0)
+                < ctx.cost_risk("risky", &required_set, &done_set, 1.0)
+        );
+        assert_eq!(
+            ctx.cost_risk("steady", &required_set, &done_set, 0.0),
+            ctx.cost_risk("risky", &required_set, &done_set, 0.0)
+        );
+    }
+
+    #[test]
+    fn risk_term_does_not_change_baseline_choices() {
+        let rooms = vec![room("variance_heavy", 10.0, 1), room("calm", 10.0, 1)];
+        let graph = graph(&rooms, &[]);
+        let stats = stats(&rooms, &[]);
+        let mut room_loads = loads(&[("variance_heavy", 3, 0, 0, 0), ("calm", 0, 1, 0, 0)]);
+        room_loads
+            .get_mut("calm")
+            .expect("calm load")
+            .in_service_remaining = vec![10.0];
+        let ctx = cost_context(&rooms, &graph, &stats, &room_loads, 20.0);
+        let required = vec!["variance_heavy".to_string(), "calm".to_string()];
+
+        assert!(ctx.wait_sigma("variance_heavy") > ctx.wait_sigma("calm"));
+        assert_eq!(
+            ctx.next_room(Strategy::FixedOrder, &required, &[]),
+            Some("variance_heavy".to_string())
+        );
+        assert_eq!(
+            ctx.next_room(Strategy::ShortestQueue, &required, &[]),
+            Some("calm".to_string())
         );
     }
 }

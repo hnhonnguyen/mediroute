@@ -152,6 +152,66 @@ pub fn route_cost(
         + walk_min.max(0.0)
 }
 
+/// One service sample is drawn Uniform(0.8μ, 1.2μ), so its standard
+/// deviation is 0.2μ/√3 = 0.4μ/√12 ≈ 0.11547μ. Learned stats keep only the
+/// EWMA mean, so the spread is reconstructed from this known distribution.
+const SERVICE_STD_FRACTION: f64 = 0.4 / 3.464_101_615_137_754_1;
+
+/// Standard deviation of the wait projected for a new patient (minutes).
+///
+/// The `n` patients ahead — in service, queued, pending starts, en-route, and
+/// likely in-system arrivals ready within the horizon (rounded up) — are
+/// split evenly over `c` independent stations, so the wait is a sum of `n/c`
+/// service draws: Var = n·σs²/c. With fewer than `c` jobs one service draw
+/// remains: Var = σs². Every ahead job counts as one chain entry, including
+/// in-service patients whose remaining time is already known, so this is a
+/// deliberately conservative spread. Expected external arrivals over the wait
+/// horizon form a Poisson stream: their count variance λ·h becomes wait
+/// variance λ·h·σs²/c. Components add, and the result is their square root.
+/// `horizon_min` is the time from now until the patient is expected to start
+/// service (walk plus projected wait).
+pub fn wait_sigma_min(
+    load: &RoomLoad,
+    est_service_min: f64,
+    capacity: usize,
+    demand: Option<&ArrivalDemand>,
+    room: &str,
+    now_min: f64,
+    horizon_min: f64,
+) -> f64 {
+    let service = est_service_min.max(0.0);
+    let capacity = capacity.max(1);
+    let sigma_service = SERVICE_STD_FRACTION * service;
+    let variance_service = sigma_service * sigma_service;
+    let horizon = horizon_min.max(0.0);
+
+    let likely: f64 = load
+        .likely_arrivals
+        .iter()
+        .filter(|arrival| arrival.ready_in_min <= horizon)
+        .map(|arrival| arrival.weight.max(0.0))
+        .sum();
+    let jobs = (load.in_service + load.queue_len + load.pending_starts + load.en_route) as f64
+        + likely;
+    let jobs = jobs.ceil();
+    let queue_variance = if jobs <= 0.0 {
+        0.0
+    } else if jobs < capacity as f64 {
+        variance_service
+    } else {
+        jobs * variance_service / capacity as f64
+    };
+
+    let arrivals = demand
+        .map(|demand| {
+            demand.expected_arrivals(room, now_min.max(0.0), (now_min + horizon).max(0.0))
+        })
+        .unwrap_or(0.0);
+    let arrival_variance = arrivals * variance_service / capacity as f64;
+
+    (queue_variance + arrival_variance).sqrt()
+}
+
 fn projected_wait(
     load: &RoomLoad,
     est_service_min: f64,
@@ -478,5 +538,60 @@ mod tests {
         // The queued patient occupies the station from minute 2 to 12. The
         // newcomer arrives at minute 5 and waits 7.
         assert!((est_wait_at_arrival_min(&room, 10.0, 1, 5.0) - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn wait_sigma_shrinks_with_parallel_capacity() {
+        let queued = load(3, &[], 0, 0);
+        let sigma_one = wait_sigma_min(&queued, 10.0, 1, None, "a", 0.0, 0.0);
+        let sigma_three = wait_sigma_min(&queued, 10.0, 3, None, "a", 0.0, 0.0);
+        // Three jobs: one chain of three draws vs one draw per station.
+        assert!(sigma_three < sigma_one, "{sigma_three} vs {sigma_one}");
+        let draw = SERVICE_STD_FRACTION * 10.0;
+        assert!((sigma_one - 3.0_f64.sqrt() * draw).abs() < 1e-9);
+        assert!((sigma_three - draw).abs() < 1e-9);
+    }
+
+    #[test]
+    fn wait_sigma_grows_with_queued_jobs() {
+        let mut previous = 0.0;
+        for n in 0..=4 {
+            let sigma = wait_sigma_min(&load(n, &[], 0, 0), 10.0, 1, None, "a", 0.0, 10.0);
+            if n == 0 {
+                assert_eq!(sigma, 0.0);
+            } else {
+                assert!(sigma > previous, "n = {n}: {sigma} vs {previous}");
+            }
+            previous = sigma;
+        }
+    }
+
+    #[test]
+    fn wait_sigma_grows_with_arrival_rate() {
+        let scenario = demo_scenario();
+        let quiet = ArrivalDemand::from_scenario(&scenario, 52);
+        let busy = ArrivalDemand::from_scenario(&scenario, 104);
+        let empty = RoomLoad::default();
+        let sigma_quiet = wait_sigma_min(&empty, 10.0, 1, Some(&quiet), "blood_test", 10.0, 15.0);
+        let sigma_busy = wait_sigma_min(&empty, 10.0, 1, Some(&busy), "blood_test", 10.0, 15.0);
+        assert!(sigma_quiet > 0.0);
+        assert!(sigma_busy > sigma_quiet, "{sigma_busy} vs {sigma_quiet}");
+        // The lull has no external arrivals, so an idle room has no wait spread.
+        assert_eq!(
+            wait_sigma_min(&empty, 10.0, 1, Some(&busy), "blood_test", 120.0, 15.0),
+            0.0
+        );
+    }
+
+    #[test]
+    fn wait_sigma_counts_in_service_jobs() {
+        // Every ahead job adds one chain entry, including an in-service
+        // patient whose remaining time is already known.
+        let busy = load(0, &[7.0], 0, 0);
+        assert!(wait_sigma_min(&busy, 10.0, 1, None, "a", 0.0, 7.0) > 0.0);
+        assert_eq!(
+            wait_sigma_min(&RoomLoad::default(), 10.0, 1, None, "a", 0.0, 0.0),
+            0.0
+        );
     }
 }
