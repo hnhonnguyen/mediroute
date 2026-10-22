@@ -1346,3 +1346,114 @@ Live seed 99 (fresh dir, speed 5000): finished `t = 399.74754874492817` phút, 5
 **Decision:** DISCARD — tiêu chí (c) của round (Optimized #1 cả 5 seeds) fail ở 2 ô. Nguyên nhân cấu trúc thú vị: serving policy tốt giúp MỌI strategies, nhưng giúp baselines NHIỀU HƠN Optimized (SQ −6.17 vs Optimized −1.48 trên seed 5 avg) vì Optimized đã tự cân bằng tải qua routing — phần lợi nhuận scheduling còn lại nhỏ hơn với strategy đã thông minh.
 
 **Kết luận chuỗi R13-R14:** serving policy (SRTF/aging) là hướng chết cho mục tiêu "Optimized tốt hơn baselines" — mọi cải thiện serving chia đều cho cả 3 strategies, phần phân biệt co lại. Hướng này chỉ có giá trị nếu mục tiêu đổi thành "cải thiện tuyệt đối toàn viện" (khi đó R14 K=10 là win: mean cả avg lẫn p90 tốt hơn, không seed regression). Patch có thể tái sử dụng từ docs.
+
+---
+
+## Round 15 — Dependency-bundle completion tie-break (chỉ Optimized)
+
+**Status:** ❌ DISCARDED (trung tính tuyệt đối — bit-identical R10, tweak không kích hoạt trong DAG demo);ng đạt tiêu chí "tốt hơn" nên không commit.
+
+**Aspect đề xuất:**
+- Tie-break `unblocks` từ R1 chỉ đếm số dependent trực tiếp còn required. Một room vẫn được điểm dù dependent của nó còn thiếu prerequisite khác — chọn room đó chưa mở được eligibility của ai.
+- Round 15 thay **công thức của chính khía cạnh `unblocks`** bằng **bundle-completion score**: room `r` có bonus nếu `r` là prerequisite CUỐI CÙNG còn thiếu của ≥1 room required khác của patient, tức sau khi hoàn tất `r`, room kia eligible ngay. Nguyên lý: prerequisite rời rạc giữ patient chờ lâu hơn; hoàn thành sớm một bundle đang dở mở tự do routing về sau.
+- Vị trí tie-break giữ nguyên: cost band 25% → walk → downtime risk → **bundle completion (thay unblocks)** → downstream depth → en-route → queue → package position. Không thêm cost term, không đổi band, predictive wait/lookahead/downtime/sim/baselines/API/frontend/learning.
+
+**Công thức:**
+
+```
+missing_before(d) = { p ∈ prereq(d) : p ∈ required(patient) ∧ p ∉ done(patient) }
+bundle_completion_score(r) =
+    |{ d : d ∈ required(patient) \ done(patient), d ≠ r,
+         r ∈ prereq(d), missing_before(d) = {r} }|
+```
+
+- So sánh giảm dần; bằng nhau thì rơi xuống downstream depth như cũ.
+- Khác `unblocks` cũ ở đúng một chỗ: dependent còn ≥2 prerequisite chưa xong không còn được tính cho bất kỳ prerequisite nào. Với dependency 1-prerequisite, score trùng `unblocks`.
+
+**Kết quả compare** (verify chuẩn: fresh `MEDIROUTE_DATA_DIR=/tmp/mediroute-r15-test` → `PORT=8082` → live seed 99 speed 5000 → compare 5 seeds; headless, cùng arrivals/packages/service samples):
+
+Seed 42:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized** | **64.0700** | **2.9150** | **77.7868** | **11.5110** |
+| FixedOrder | 77.0249 | 5.9134 | 130.2068 | 13.4523 |
+| ShortestQueue | 71.3185 | 4.3273 | 103.8948 | 13.5720 |
+
+Seed 7:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized** | **72.2299** | **4.4230** | **128.1961** | **11.8492** |
+| FixedOrder | 84.3898 | 7.0846 | 138.8932 | 13.8233 |
+| ShortestQueue | 77.8194 | 5.5577 | 139.7541 | 13.0962 |
+
+Seed 123:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized** | **72.2939** | **6.5969** | **116.3665** | **10.8056** |
+| FixedOrder | 86.4409 | 10.1679 | 145.2265 | 12.7288 |
+| ShortestQueue | 81.0868 | 8.6726 | 126.7505 | 12.4931 |
+
+Seed 5:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized** | **118.2913** | **17.1310** | **240.0492** | **11.5275** |
+| FixedOrder | 124.1452 | 18.3369 | 240.2734 | 12.9288 |
+| ShortestQueue | 119.3817 | 16.9931 | 246.6130 | 13.1272 |
+
+Seed 2024:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized** | **68.9360** | **3.7923** | **113.5368** | **11.7520** |
+| FixedOrder | 79.4512 | 6.0142 | 144.2094 | 13.8921 |
+| ShortestQueue | 74.2294 | 4.8259 | 124.3680 | 13.1494 |
+
+Mean 5 seeds (Optimized):
+
+| Metric | R10 | R15 | Δ |
+|---|---|---|---|
+| avg_total | 79.1642 | **79.1642** | 0 |
+| avg_wait | 6.9716 | **6.9716** | 0 |
+| p90_total | 135.1871 | **135.1871** | 0 |
+| avg_walk | 11.4891 | **11.4891** | 0 |
+
+- Toàn bộ kết quả **bit-identical R10**, không chỉ Optimized: baselines khớp từng số (serving policy vẫn FIFO), và live seed 99 cũng trùng khít nên learned stats dùng cho compare là cùng trạng thái.
+- Live seed 99 (fresh dir, speed 5000→clamp 60): finished `t = 399.74754874492817` phút, 52/52, 188 visits; **78.0142 / 6.6068 / 146.5977 / 16.4670 / 11.0451** (avg_total/avg_wait/p90_total/p90_wait/avg_walk) — y hệt R10.
+
+**Đánh giá theo tiêu chí:**
+- **(a) Mean 5 seeds tốt hơn R10 trên avg_total VÀ p90_total: ❌ KHÔNG ĐẠT.** Bằng nhau tuyệt đối (79.1642 vs 79.1642; 135.1871 vs 135.1871) — "tốt hơn" theo nghĩa strict không xảy ra.
+- **(b) Không seed nào p90_total tệ hơn R10 quá 5%: ✅ ĐẠT.** Δ = 0 ở cả 5 seeds.
+- **(c) Optimized vẫn #1 mọi seed mọi metric chính: ✅ ĐẠT.** avg_total/p90_total lần lượt: s42 64.07/77.79; s7 72.23/128.20; s123 72.29/116.37; s5 118.29/240.05 (sát: hơn ShortestQueue 1.09 avg, hơn FixedOrder 0.22 p90); s2024 68.94/113.54.
+- Baselines giữ đúng R10 (FIFO serving), xác nhận thay đổi chỉ nằm trong Optimized và không đụng sim.
+
+**Vì sao trung tính (phân tích):**
+- Trong DAG demo, **Cardiology là room duy nhất có 2 prerequisite** (Blood Test, ECG). Bundle score chỉ khác `unblocks` khi cả Blood lẫn ECG cùng chưa xong: khi đó cả hai cùng mất 1 điểm (old 1/1 → new 0/0), nên thứ hạng tương đối Blood–ECG không đổi.
+- So với room depth-0 độc lập (ENT, Eye Exam, ...) ở các cặp walk bị clamp bằng nhau, **downstream depth** — khóa ngay sau bundle — vẫn xếp Blood/ECG lên trên vì chúng có chain Cardiology. Room depth-1 còn lại là X-Ray không bao giờ tie walk với Blood/ECG tại 10 vị trí khả dĩ (entrance + 9 phòng), nên không có cặp nào để bundle score lật kết quả.
+- Nói cách khác, trong workload hiện tại `unblocks` cũ và bundle score tạo cùng thứ tự ở mọi comparison thực sự chạm tới khóa này; các test synthetic xác nhận cơ chế mới hoạt động đúng, nhưng demo scenario không có bundle bất đối xứng để khai thác.
+- Live seed 99 bit-identical xác nhận thêm: quyết định routing trên đường live không đổi, do đó learned stats cho compare cũng không đổi.
+
+**Tests:**
+- `cargo test`: **79/79 pass** (74 cũ + 5 mới). **Không test cũ nào phải đổi expectation**; hai test tie-break cũ (`optimized_tie_break_unblocks_dependent_rooms`, `tie_break_prefers_deeper_dependency_chain_within_cost_band`) vẫn pass nguyên trạng vì hành vi của chúng không phụ thuộc phần bị thay đổi.
+- 5 test mới: (1) `bundle_completion_prefers_the_last_missing_prerequisite_within_the_band` — ECG là prerequisite cuối còn thiếu của Cardiology, thắng ENT cùng cost/walk; (2) `prerequisite_with_another_missing_prerequisite_earns_no_bundle_bonus` — Blood/ECG cùng thiếu vì Cardiology cần cả hai → score 0, X-Ray (prerequisite cuối của Orthopedics) thắng; (3) `bundle_bonus_does_not_override_cost_outside_the_band` — unlock có bundle bonus nhưng service 40 vs 10, cost ngoài band nên thua; (4) `baselines_ignore_bundle_completion` — FixedOrder/ShortestQueue vẫn chọn Blood; (5) `single_room_patient_is_unaffected_by_bundle_scoring` — dependency không áp dụng khi room kia không required, only-room vẫn là lựa chọn duy nhất.
+
+**Files changed:** `backend/src/engine/router.rs` (thay `unblocks` bằng `bundle_completion_score`, dùng ở đúng vị trí tie-break cũ; 5 test mới), `docs/rounds/README.md` (section này). Không đổi `congestion.rs`, `sim.rs`, `domain.rs`, `scenario.rs`, `stats.rs`, `learn.rs`, `api.rs`, `main.rs`, frontend, README top-level.
+
+**Verify steps:**
+1. `cargo test`: 79/79 pass. `npm run build`: OK (frontend không đổi; chỉ warning chunk > 500 kB có từ trước).
+2. Fresh `MEDIROUTE_DATA_DIR=/tmp/mediroute-r15-test`, server riêng `PORT=8082`; live `{strategy:optimized, speed:5000, seed:99}` → finished t = 399.7475 phút, 52/52, 188 visits, metrics trùng R10.
+3. `POST /api/sim/compare` seed 42 → 7 → 123 → 5 → 2024; ghi đủ avg_total/avg_wait/p90_total/avg_walk cho cả 3 strategies; đối chiếu từng số với R10 (đo baseline tại HEAD trên cùng quy trình trước khi sửa): khớp 100%.
+4. Port 8080 không đụng; **không git commit/push**.
+
+**Decision:** **KHÔNG COMMIT** — không có cải thiện đo được, cũng không có regression. Working tree giữ code + docs để coordinator verify độc lập.
+
+**Bài học:** bundle completion là một mịn hóa đúng nghĩa của `unblocks`, nhưng tín hiệu của nó bị **đối xứng hóa** trong DAG demo: Cardiology có đúng 2 prerequisite nên hai ứng viên luôn mất điểm như nhau, còn khi so với room độc lập thì downstream depth đã nói cùng một điều. Muốn bundle score tạo khác biệt cần bundle bất đối xứng (≥2 nhánh với độ sâu/chi phí khác nhau, hoặc nhiều dependent chia sẻ prerequisite), điều scenario hiện tại không có. Đây là negative result sạch: cơ chế đúng, ca sử dụng vắng.
+
+**Verify độc lập (coordinator):** cargo test 79/79 (trước revert), 74/74 (sau revert). Agent trình bày bằng chứng bit-identical đầy đủ (15 cặp × 4 metric + live run) và root-cause thuyết phục: Cardiology là phòng duy nhất có 2 prerequisite; khi cả 2 chưa xong, điểm mới cũ cùng 0 — không có bundle bất đối xứng trong DAG demo để khai thác.
+
+**Decision:** DISCARD — trung tính không phải "tốt hơn". Ý tưởng chỉ có giá trị nếu DAG có nhiều phòng đa-prerequisite bất đối xứng (ví dụ phòng cần 2 lab riêng + 1 imaging); trong demo hiện tại không có case.
+
+**Bài học 15 rounds:** router per-decision (R2, R12, R15 fail), serving policy (R13, R14 fail cho mục tiêu so sánh), learning (R9 fail) đều đã thử. Thành công nằm ở: mô hình vật lý chính xác hơn (R3 distances), lookahead có kiểm soát (R4), mô hình congestion tương lai (R8), chi tiết mô hình đúng (R10). Hướng còn lại nếu làm tiếp: scenario có cấu trúc giàu hơn (DAG sâu, nhiều đa-prerequisite) rồi đo lại — nhưng đó là đổi benchmark chứ không phải đổi thuật toán.
