@@ -1803,3 +1803,109 @@ h = walk(now → room) + wait_at(room)     // horizon tới lúc bệnh nhân d�
 **Decision:** **DISCARD — không thay đổi code.** Giả thuyết secondary-peak under-pricing bị bác bỏ: bias dương có hệ thống ở 5/5 seeds và 3/3 sub-windows; max-cap làm calibration tệ hơn. Working tree chỉ giữ section docs này để coordinator đối chiếu; không có candidate nào để commit ngoài docs.
 
 **Bài học:** (1) Cơ chế model-vs-model có thể đúng (demand@ETA > wait_at ở 46% quyết định) nhưng vẫn không tạo under-prediction thực — phải luôn kiểm chứng với **actual wait**, không chỉ so hai estimator. (2) Walk-time drain khiến `wait_at` over-predict gần như mọi nơi, kể cả trong rush phụ; vì vậy mọi cap làm tăng giá (max-cap) là sai hướng. (3) R17 min-cap là can thiệp đúng nhưng có phạm vi; mở rộng nó sang `[150,210)` là giả thuyết khác (min-cap, không phải rising-demand max-cap), có bằng chứng calibration ủng hộ nhưng cần một round riêng để benchmark trước khi kết luận.
+
+## Round 19 — Secondary-peak min-cap extension
+
+**Status:** ❌ DISCARD — giả thuyết mở rộng min-cap sang rush phụ bị bác bỏ ở mức outcome: **41 cấu hình được chạy (control + 40 biến thể), không cấu hình nào cải thiện mean p90 5 seeds** (mốc 129.9813); đa số làm tệ tail, đặc biệt s42 (+10.26) và s5 (+16.98). Không thay đổi code routing; working tree chỉ thêm section docs này.
+
+**Aspect đề xuất:**
+- R17 đã commit min-cap `first_step_wait = min(wait_at, demand@ETA)` trong `[100,150)` và chứng minh cơ chế "chỉ giảm, không bao giờ inflate" là đúng ở post-peak. R18 để lại tín hiệu calibration chưa khai thác: trong nhóm quyết định `now ≥ 150` (rush phụ), `wait_at` có bias +7.22 / MAE 7.47, còn `demand@ETA` là +3.59 / MAE 4.34 — calibrated tốt hơn gần gấp đôi; ở `[180,210)` là 8.90 vs 3.97.
+- Hypothesis: nếu `demand@ETA` calibrated hơn trong rush phụ và cả hai estimators đều over-predict, thì mở rộng min-cap sang cửa sổ quyết định `now ∈ [150,210)` (hoặc biến thể cửa sổ/công thức khác) sẽ cắt bớt over-prediction của `wait_at` mà không bao giờ làm tăng giá, đúng cơ chế đã thắng ở R17.
+
+**Số liệu R18 dùng lại (không đo lại):**
+
+| Nhóm quyết định | n | `wait_at` bias / MAE | `demand@ETA` bias / MAE |
+|---|---|---|---|
+| decided `now < 150` (R17 active) | 47 | +9.94 / 10.34 | +1.61 / 3.82 |
+| decided `now ≥ 150` (rush phụ) | 216 | +7.22 / 7.47 | +3.59 / 4.34 |
+| ETA ∈ `[150,180)` | 95 | +5.06 / 5.63 | +2.91 / 4.21 |
+| ETA ∈ `[180,210)` | 127 | +8.76 / 8.90 | +3.73 / 3.97 |
+
+- Lưu ý quan trọng từ R18: `demand@ETA < actual` chỉ 13/263 quyết định (4.9%), `wait_at < actual` chỉ 5/263 (1.9%) — cả hai vẫn over-predict, nên min-cap chỉ được phép chọn ước lượng nhỏ hơn, không được inflate.
+
+**Thiết kế sweep (tạm, đã revert hoàn toàn):**
+- Override tạm trong `router.rs`: cửa sổ mở rộng `[start,end)`, anchor theo `now` hoặc theo `ETA = now + walk`, giữ/tắt R17; các mode hiệu chỉnh: `min` (R17-style), `margin:m` → `min(wait_at, demand@ETA + m)`, `minwait:t` (chỉ áp dụng khi `wait_at ≥ t`), `blend:w` → `min(wait_at, (1−w)·wait_at + w·demand@ETA)`, `walkfloor` → `min(wait_at, max(demand@ETA, wait_at − walk))`, `walkcap` → `wait_at − walk` (chẩn đoán).
+- Harness tạm `#[ignore]` trong `sim.rs` tái hiện đúng protocol server: fresh learner → live Optimized seed 99 → stats snapshot → compare 5 seeds × 3 strategies. Control `[100,150)` tái tạo **bit-identical** HEAD (live t=408.145081, 83.4505/8.0682/157.1367/11.1977; mean 79.9008 / 129.9813) — harness hợp lệ. Mọi biến thể min-cap đều để live seed 99 bit-identical; chỉ biến thể chẩn đoán `walkcap` làm đổi live (t=408.1118), nên kết quả compare của các biến thể min-cap là apples-to-apples.
+- Tổng cộng 41 cấu hình (control + 40 biến thể; một số tương đương hành vi vì cửa sổ liền mạch với R17), mỗi cấu hình đủ 5 seeds. Baselines bất biến ở toàn bộ batch (FixedOrder/ShortestQueue khớp từng số HEAD).
+
+**Variant sweep — mean 5 seeds (Optimized), Δ so với HEAD:**
+
+| Variant | Mean avg | Δ avg | Mean p90 | Δ p90 |
+|---|---|---|---|---|
+| **R17 control `[100,150)`** | **79.9008** | — | **129.9813** | — |
+| `[100,210)` now | 80.6445 | +0.93% | 135.4290 | +5.4477 |
+| `[150,210)` now (≡ `[100,210)` vì liền mạch R17) | 80.6445 | +0.93% | 135.4290 | +5.4477 |
+| `[135,210)` now (≡ `[100,210)` cùng lý do) | 80.6445 | +0.93% | 135.4290 | +5.4477 |
+| `[150,180)` now | 80.4651 | +0.71% | 132.0339 | +2.0526 |
+| `[150,165)` now | 80.4893 | +0.74% | 132.0893 | +2.1080 |
+| `[150,160)` now | 80.0814 | +0.23% | 129.9813 | 0 |
+| `[150,210)` ETA (≡ now-based) | 80.6445 | +0.93% | 135.4290 | +5.4477 |
+| ETA ∈ `[150,165)` | 80.0814 | +0.23% | 129.9813 | 0 |
+| ETA ∈ `[150,180)` | 80.5657 | +0.83% | 132.1753 | +2.1940 |
+| ETA ∈ `[180,210)` | 80.2931 | +0.49% | 136.0288 | +6.0475 |
+| ETA ∈ `[190,210)` | 80.1007 | +0.25% | 134.4560 | +4.4747 |
+| `[150,180)` margin:4 | 79.7263 | −0.22% | 130.0022 | +0.0209 |
+| `[150,180)` margin:6 | 79.5247 | −0.47% | 130.0022 | +0.0209 |
+| `[150,210)` margin:6 | 79.9201 | +0.02% | 132.4440 | +2.4627 |
+| `[150,210)` minwait:10 | 80.5995 | +0.87% | 134.4383 | +4.4570 |
+| `[150,210)` walkfloor | 79.2719 | −0.79% | 134.0685 | +4.0872 |
+| `[150,210)` blend:0.75 | 80.0107 | +0.14% | 131.7401 | +1.7588 |
+| `[150,180)` walkcap (chẩn đoán) | 79.0924 | −1.01% | 136.5459 | +6.5646 |
+| Chỉ rush phụ `[150,210)`, tắt R17 | 79.6392 | −0.33% | 135.4290 | +5.4477 |
+| ETA-overall `[100,210)`, thay R17 | 80.7689 | +1.09% | 135.0757 | +5.0944 |
+
+- **Không một cấu hình nào có mean p90 < 129.9813.** Tốt nhất là hòa (các cửa sổ rất hẹp `[150,160)` / ETA `[150,165)`), phần còn lại tệ hơn +1.76…+6.56.
+- Toàn cửa sổ `[150,210)` làm p90 tăng ở **s42 78.41→88.67 (+10.26)** và **s5 211.63→228.61 (+16.98 — đúng bằng mức R16 trước R17)**, hai seeds còn lại không đổi. Tức mở rộng min-cap không những không thêm gain mà còn xóa đúng mức tail gain R17 đạt được trên s5.
+- Cửa sổ hẹp hơn: `[150,180)` chỉ tăng s42 (+10.26) và p90 mean +2.05; `[150,165)` tăng s42 (+10.54); `[150,160)` không đổi p90 seed nào nhưng mean avg +0.23% → không có lợi ích.
+- Damping (margin/walkfloor/blend/minwait) có thể cải thiện mean avg (walkcap `[150,180)` −1.01%, walkfloor −0.79%, margin `[150,180)` −0.22…−0.47%) nhưng **không bao giờ cải thiện p90**; margin `[150,180)` vẫn +0.0209 (không tốt hơn mốc).
+- Cross-ETA không phải là lối thoát: với R17 giữ nguyên, `[150,210)` ETA trùng hành vi `[150,210)` now vì mọi quyết định `now ≥ 150` đều có ETA ≥ 150, còn `now < 150` đã nằm trong R17. Các cửa sổ ETA hẹp khác (`[150,165)`, `[150,180)`, `[180,210)`, `[190,210)`) cũng không cải thiện p90.
+
+**Diễn giải — vì sao calibration tốt hơn không thắng outcome:**
+- Min-cap cải thiện dự báo wait theo từng quyết định nhưng đồng thời **đổi thứ tự chọn phòng** trong rush phụ. `lookahead_cost` (R8) và `wait_sigma` (R16) vẫn dùng `wait_at` theo đúng ràng buộc round, nên giá first-step và giá lookahead/rủi ro không còn nhất quán; các ca tail dài (p90) nhạy với vài lần đổi phòng này và xấu đi.
+- Cả hai estimators vẫn over-predict actual (R18: chỉ 1.9%/4.9% quyết định là under-predict), nên min-cap không sửa được "độ lệch nền" mà chỉ khuếch đại lệch giữa các phòng. R17 cắt đúng phần walk bị tính hai lần ở post-peak; sang rush phụ, phần bị cắt nhiều hơn và không tương ứng với cải thiện actual total.
+- Ranh giới cửa sổ là một phần của cơ chế, không phải chi tiết: chỉ cần mở tới 165 là s42 bắt đầu xấu; mở tới 210 thì s5 mất toàn bộ gain R17. Đây là lý do không có biến thể "gần đúng" nào đạt cả ba tiêu chí.
+
+**Compare 5 seeds trên final tree** (HEAD, không đổi code — bit-identical R17/R18):
+
+| Seed | Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|---|
+| 42 | **Optimized** | **65.0999** | **3.1666** | **78.4098** | **11.6167** |
+| 42 | Fixed Order | 77.0249 | 5.9134 | 130.2068 | 13.4523 |
+| 42 | Shortest Queue | 71.3185 | 4.3273 | 103.8948 | 13.5720 |
+| 7 | **Optimized** | **73.6461** | **4.8477** | **128.1961** | **11.6399** |
+| 7 | Fixed Order | 84.3898 | 7.0846 | 138.8932 | 13.8233 |
+| 7 | Shortest Queue | 77.8194 | 5.5577 | 139.7541 | 13.0962 |
+| 123 | **Optimized** | **73.2556** | **6.8929** | **116.3665** | **10.7541** |
+| 123 | Fixed Order | 86.4409 | 10.1679 | 145.2265 | 12.7288 |
+| 123 | Shortest Queue | 81.0868 | 8.6726 | 126.7505 | 12.4931 |
+| 5 | **Optimized** | **117.5001** | **16.9063** | **211.6310** | **11.5661** |
+| 5 | Fixed Order | 124.1452 | 18.3369 | 240.2734 | 12.9288 |
+| 5 | Shortest Queue | 119.3817 | 16.9931 | 246.6130 | 13.1272 |
+| 2024 | **Optimized** | **70.0024** | **4.0933** | **115.3030** | **11.6839** |
+| 2024 | Fixed Order | 79.4512 | 6.0142 | 144.2094 | 13.8921 |
+| 2024 | Shortest Queue | 74.2294 | 4.8259 | 124.3680 | 13.1494 |
+
+- Mean 5 seeds (Optimized): avg_total **79.9008**, avg_wait 7.1813, p90_total **129.9813**, avg_walk 11.4521; FixedOrder 90.2904 / 9.5034 / 159.7619 / 13.3650; ShortestQueue 84.7672 / 8.0753 / 148.2761 / 13.0876. Baselines khớp R17/R18 từng số.
+- Live seed 99: finished `t = 408.145081`, 52/52, 188 visits, 83.4505 / 8.0682 / 157.1367 / 20.5701 / 11.1977 — bit-identical R17/R18.
+
+**Đánh giá theo tiêu chí:**
+- **(a) Mean p90_total 5 seeds tốt hơn 129.9813: ❌ KHÔNG ĐẠT** — không cấu hình nào tốt hơn; tốt nhất là hòa 129.9813 (`[150,160)` now / ETA `[150,165)`), toàn cửa sổ +5.4477.
+- **(b) Mean avg_total không tệ hơn 1%: ✅ ĐẠT** cho control và nhiều biến thể damping (walkcap −1.01%, walkfloor −0.79%), nhưng các biến thể này đều trượt (a).
+- **(c) Optimized #1 mọi seed mọi metric chính: ✅ ĐẠT 10/10 ô** trên final tree; các ứng viên nhẹ (`[150,160)`, margin `[150,180)`) cũng giữ 10/10, nhưng không đạt (a).
+- **Không có candidate nào đạt cả 3 tiêu chí → DISCARD theo protocol.** Đây là kết quả âm hợp lệ, không phải regression: final tree không đổi so với HEAD.
+
+**Tests:**
+- `cargo test`: **87/87 pass** trước khi instrument và sau khi revert. Không thêm test production vì không giữ thay đổi logic nào (R18 precedent).
+- Override tạm trong `router.rs` và harness `#[ignore]` trong `sim.rs` đã revert hoàn toàn; `git diff` cuối cùng chỉ chứa `docs/rounds/README.md`.
+
+**Files changed:** `docs/rounds/README.md` (section này). Không đổi `router.rs`, `congestion.rs`, `sim.rs`, `api.rs`, `main.rs`, `domain.rs`, `scenario.rs`, `stats.rs`, `learn.rs`, frontend, baselines, serving/FIFO, priority, downtime, learning, API/JSON, tie-band, lookahead, σ term.
+
+**Verify steps:**
+1. `cd backend && ~/.local/bin/cargo test` → 87/87 pass (HEAD và sau revert).
+2. Baseline/final: fresh `MEDIROUTE_DATA_DIR=/tmp/mediroute-r19-test`, server riêng `PORT=8082` (không đụng 8080), live `{strategy:optimized, speed:5000, seed:99}` → 408.145081 phút, 52/52, 188 visits, metrics như trên; compare 42/7/123/5/2024 khớp R17/R18 từng số, Optimized #1 10/10 ô.
+3. Sweep: harness tạm trong `sim.rs` (fresh learner → live seed 99 → snapshot → 5 seeds × 3 strategies) + override tạm trong `router.rs`; 41 cấu hình; mỗi cấu hình đủ 5 seeds; baselines bất biến; control bit-identical HEAD.
+4. Revert instrumentation; `git status` sạch (chỉ docs); port 8080 không đụng; server 8082 đã dừng; **không git commit/push**.
+
+**Decision:** **DISCARD — không thay đổi code.** Giả thuyết mở rộng min-cap sang rush phụ bị bác bỏ ở mức outcome: 41 cấu hình, zero cấu hình cải thiện mean p90; full window còn xóa đúng gain tail R17 trên s5. Working tree chỉ giữ section docs này để coordinator đối chiếu.
+
+**Bài học:** (1) Calibration (bias/MAE) là điều kiện cần nhưng không đủ: estimator tốt hơn theo từng quyết định vẫn có thể làm routing tệ hơn vì thay đổi thứ tự chọn phòng, đặc biệt khi lookahead/σ vẫn dùng estimator cũ — phải benchmark outcome, không suy diễn từ calibration. (2) Min-cap của R17 hiệu quả trong một phạm vi hẹp; mở rộng sang rush phụ không những không cộng thêm gain mà còn xóa gain cũ (s5 +16.98, đúng về mức R16), nên biên cửa sổ là một phần của thiết kế. (3) Khi hypothesis thất bại, sweep đủ rộng (window/anchor/formula/damping) và báo DISCARD trung thực là kết quả đúng — không ép một biến thể "gần đạt" thành commit.
