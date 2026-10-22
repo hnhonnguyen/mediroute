@@ -1200,3 +1200,149 @@ Live seed 99 (fresh dir, speed 5000→clamp 60): finished `t = 399.7475487449281
 **Decision:** DISCARD — mục tiêu là giảm CẢ avg_total lẫn p90; SRTF cải thiện avg nhẹ nhưng làm tệ p90 trung bình (đúng điểm yếu starvation của SRTF: patient tour dài bị đói đúng lúc contention cao). Tiêu chí 3-seed của round đã đạt nhưng không khái quát — 5-seed evidence (chuẩn từ R8) cho thấy đây là trade-off sai chiều. Code reverted, cargo test 74/74.
 
 **Bài học:** nếu thử lại hướng scheduling, cần hybrid chống starvation (ví dụ aging: effective_tour = tour / (1 + wait_so_far / k)) để SRTF không bỏ đói long-tour patients — hoặc giới hạn SRTF chỉ áp khi queue ngắn. Vấn đề của R13 không phải ý tưởng serving policy mà là thiếu cơ chế bảo vệ tail.
+
+---
+
+## Round 14 — Aging-protected SRTF room scheduling (retry Round 13)
+
+**Status:** ❌ DISCARDED (verify độc lập xác nhận: (a)(b) đạt nhưng (c) fail — baselines hưởng lợi không đối xứng), không phải lỗi triển khai.
+
+**Aspect đề xuất:**
+- R13 (SRTF thuần) thắng mean 3 seed nhưng bị discard vì starvation: seed 5 p90_total +15.6% (+37.4 phút) và Optimized mất #1 avg_total về ShortestQueue.
+- Round 14 giữ nguyên điểm can thiệp **serving policy trong phòng**, áp dụng **cùng một policy cho cả 3 strategies** (chính sách bệnh viện cấp hệ thống), và thêm **aging** để long-tour patients không bị bỏ đói: `effective_tour = remaining_tour / (1 + wait_so_far / K)`.
+- Router (`router.rs`, `congestion.rs`), API/JSON, frontend, learning, downtime, arrivals, priority class semantics **không đổi**. Vì serving policy đổi, số của FixedOrder/ShortestQueue **đổi so với R10 — đây là kỳ vọng**, không phải regression routing.
+- Đánh giá trên **5 seeds** (42, 7, 123, 5, 2024) theo 3 tiêu chí: (a) mean 5 seeds tốt hơn R10 trên avg_total và p90_total; (b) không seed nào p90_total tệ hơn R10 quá 5%; (c) Optimized vẫn #1 avg_total + p90_total trên cả 5 seeds.
+
+**Thiết kế:**
+- **Enqueue:** luôn `push_back` — queue vật lý giữ arrival order; priority áp tại dispatch, không áp lúc enqueue.
+- **Dispatch (khi station rảnh):** (1) priority class cao nhất có mặt (urgent > normal, giữ nguyên semantics); (2) `effective_tour_min` nhỏ nhất; (3) index queue sớm nhất (FIFO tie-break).
+- **Remaining tour:** tổng `est_service_min` **học được** của các `required_rooms` chưa `done` (gồm cả phòng đang xếp hàng — hằng số chung trong cùng queue, không đổi thứ tự).
+- **Wait so far:** `now − queue_joined_at` (thời điểm patient tới phòng và vào queue).
+- **Không preemption:** in-service luôn chạy hết; chỉ chọn người kế tiếp khi slot trống. Deterministic: quét `VecDeque` theo index, so sánh strict `<`, tie giữ index đầu; không thêm RNG.
+- **K chọn:** `AGING_K_MIN = 10.0` phút (sweep bắt buộc 10/20/40; 10 tốt nhất — xem dưới). K → ∞ = SRTF thuần (R13); K nhỏ = wait chi phối mạnh hơn. Lưu ý: K → 0 **không** tiến tới FIFO tuyệt đối mà tiến tới thứ tự `wait / remaining_tour`; đây là lý do không thể dùng K nhỏ để tái tạo baseline FIFO của R10.
+- Implementation nằm trong `sim.rs`: `AGING_K_MIN`, `aging_k`, `remaining_tour_min`, `effective_tour_min`, `next_dispatch_index`, `dispatch_room`. `router.rs` và `congestion.rs` không đổi.
+
+**Sweep K** (mỗi mức fresh data dir → live seed 99 → compare 5 seeds; số là Optimized avg_total/p90_total):
+
+| K | seed 42 | seed 7 | seed 123 | seed 5 | seed 2024 | Mean avg/p90 | (a) | (b) | (c) |
+|---|---|---|---|---|---|---|---|---|---|
+| R10 (ref) | 64.07 / 77.79 | 72.23 / 128.20 | 72.29 / 116.37 | 118.29 / 240.05 | 68.94 / 113.54 | 79.16 / 135.19 | — | — | — |
+| **10 (chọn)** | **63.65 / 75.59** | **72.87 / 128.20** | **73.04 / 116.37** | **116.81 / 240.05** | **68.94 / 113.54** | **79.06 / 134.75** | ✅ | ✅ | ❌ 2 cells |
+| 20 | 63.65 / 75.59 | 71.99 / 128.30 | 72.89 / 116.37 | 117.79 / 240.05 | 68.94 / 113.54 | 79.05 / 134.77 | ✅ | ✅ | ❌ 2 cells |
+| 40 | 62.34 / 73.97 | 71.99 / 128.30 | 72.96 / 116.37 | 117.71 / **253.06** | 68.65 / 113.54 | 78.73 / **137.05** | ❌ p90 | ❌ seed 5 +5.42% | ❌ |
+| 5 (diagnostic) | 63.65 / 75.59 | 72.87 / 128.20 | 72.07 / 116.37 | 117.33 / 240.05 | 68.94 / 113.54 | 78.97 / 134.75 | ✅ | ✅ | ❌ 2 cells |
+| 1 (diagnostic) | 64.16 / 78.92 | 71.40 / 128.30 | 72.51 / 116.37 | 117.79 / 240.05 | 68.94 / 113.54 | 78.96 / **135.44** | ❌ p90 | ✅ | ❌ 2 cells |
+| 0.1 (diagnostic) | 63.89 / 81.47 | 71.40 / 128.30 | 72.46 / 116.37 | 117.79 / 240.05 | 68.94 / 113.54 | 78.90 / **135.95** | ❌ p90 | ✅ | ❌ 2 cells |
+| Guard T=20, K=10 (diagnostic) | 62.34 / 73.97 | 72.94 / 132.48 | 72.44 / 116.37 | 117.74 / **279.16** | 68.94 / 113.54 | 78.88 / **143.10** | ❌ p90 | ❌ seed 5 +16.3% | ❌ |
+
+- **K=10 được chọn** trong bộ bắt buộc: pass (a) với biên dương cả 2 metric, pass (b) với seed tệ nhất đúng bằng R10 (seed 5 p90 240.049 vs 240.05), và là mức có biên (c) tốt nhất (seed 123 p90 chỉ còn kém FixedOrder 1.31 phút; seed 5 avg kém SQ 3.60 phút). K=20 có mean avg nhích tốt hơn 0.01 phút nhưng (c) xấu hơn rõ (seed 123 p90 là #3 sau cả SQ).
+- **K=40 đụng guardrail (b)**: seed 5 p90 253.06 = **+5.42%** so 240.05, đồng thời mean p90 137.05 tệ hơn R10 → fail (a). Aging ở K=40 vẫn đủ mạnh để hạ seed 5 từ 277.42 (R13) xuống 253.06 nhưng không đủ để về mức R10.
+- **K=1 / K=0.1** không cứu được (c) và còn làm mean p90 tệ hơn R10 (+0.18% / +0.56%). Lý do: K→0 cho thứ tự `wait/remaining_tour`, không phải FIFO; baseline numbers vẫn không trở về R10.
+- **Guard T=20** (aging chỉ bắt đầu sau 20 phút chờ) cứu seed 123 p90 (Optimized 116.37 < FixedOrder 128.03) nhưng phá seed 5 p90 (279.16, +16.3%) và mean p90 (+5.86%) → loại. Không threshold nào dung hòa được hai phía; xem phân tích (c).
+- **K → ∞ = R13:** seed 123 p90 99.17 (sẽ là #1) nhưng seed 5 p90 277.42 (+15.6%) và seed 5 avg #2 — đúng negative result đã discard.
+
+**Kết quả compare K=10** (verify chuẩn: fresh `/tmp/mediroute-r14-test` → PORT=8082 → live seed 99 speed 5000 → compare 5 seeds; headless, cùng arrivals/packages/service samples):
+
+Seed 42:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized** | **63.65** | **2.80** | **75.59** | **11.50** |
+| FixedOrder | 77.48 | 6.04 | 132.94 | 13.45 |
+| ShortestQueue | 70.28 | 4.07 | 119.07 | 13.48 |
+
+Seed 7:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized** | **72.87** | **4.61** | **128.20** | **11.76** |
+| FixedOrder | 82.42 | 6.57 | 140.68 | 13.82 |
+| ShortestQueue | 79.59 | 5.90 | 138.89 | 13.54 |
+
+Seed 123:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized** | **73.04** | **6.81** | 116.37 | **10.82** |
+| FixedOrder | 84.69 | 9.66 | **115.06** | 12.73 |
+| ShortestQueue | 80.83 | 8.56 | 118.76 | 12.64 |
+
+Seed 5:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| Optimized | 116.81 | 16.73 | **240.05** | **11.52** |
+| FixedOrder | 118.69 | 16.86 | 346.30 | 12.93 |
+| ShortestQueue | **113.21** | **15.33** | 309.73 | 13.09 |
+
+Seed 2024:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized** | **68.94** | **3.79** | **113.54** | **11.75** |
+| FixedOrder | 79.12 | 5.93 | 131.23 | 13.89 |
+| ShortestQueue | 74.01 | 4.75 | 124.37 | 13.21 |
+
+Baselines **không còn khớp R10** — đúng kỳ vọng vì serving policy đổi. Đo trực tiếp R10 (worktree sạch tại HEAD, compare cùng seeds; routing baselines không đọc stats): seed 5 FixedOrder **124.15 / 18.34 / 240.27 / 12.93**, ShortestQueue **119.38 / 16.99 / 246.61 / 13.13**; seed 123 FixedOrder **86.44 / 10.17 / 145.23 / 12.73**, ShortestQueue **81.09 / 8.67 / 126.75 / 12.49**. Serving policy mới giúp SQ seed 5 avg −6.17 phút và FO seed 123 p90 −30.17 phút — chính là nguồn làm tiêu chí (c) trượt.
+
+**Đánh giá vs Round 10 (Optimized, mean 5 seeds):**
+
+| Metric | R10 | R14 (K=10) | Δ |
+|---|---|---|---|
+| avg_total | 79.16 | **79.06** | **−0.10 (−0.13%)** |
+| p90_total | 135.19 | **134.75** | **−0.44 (−0.33%)** |
+| avg_wait | 6.57* | 5.95 | −0.62 |
+| avg_walk | 11.51* | 11.47 | −0.04 |
+
+*Mean từ 5 reference đã cho.
+
+Per-seed Optimized vs R10:
+
+| Seed | Δ avg_total | Δ p90_total | p90 so R10 |
+|---|---|---|---|
+| 42 | −0.42 (−0.66%) | −2.19 (−2.82%) | −2.82% |
+| 7 | +0.64 (+0.88%) | −0.00 | −0.00% |
+| 123 | +0.75 (+1.03%) | −0.00 | −0.00% |
+| 5 | −1.48 (−1.25%) | −0.00 | −0.00% |
+| 2024 | −0.00 | −0.00 | −0.00% |
+
+**Đánh giá theo tiêu chí:**
+- **(a) Optimized mean 5 seeds tốt hơn R10 trên avg_total VÀ p90_total: ✅ ĐẠT.** 79.06 vs 79.16 (−0.13%); 134.75 vs 135.19 (−0.33%).
+- **(b) Không seed nào p90_total tệ hơn R10 quá 5%: ✅ ĐẠT.** Không seed nào tệ hơn cả; seed 42 −2.82%, các seed còn lại dao động ≤0.001% (seed 5 đúng bằng 240.05). So với R13 (seed 5 +15.6%), aging đã sửa đúng điểm starvation.
+- **(c) Optimized vẫn #1 avg_total + p90_total trên cả 5 seeds: ❌ KHÔNG ĐẠT.** Đạt 8/10 ô:
+  - seed 42, 7, 2024: Optimized #1 cả avg_total lẫn p90_total.
+  - seed 123: Optimized #1 avg_total (73.04) nhưng **p90_total #2** — 116.37 vs FixedOrder 115.06 (ShortestQueue 118.76).
+  - seed 5: Optimized #1 p90_total (240.05) nhưng **avg_total #2** — 116.81 vs ShortestQueue 113.21 (FixedOrder 118.69).
+  - Nếu xét **mean 5 seeds** (không phải per-seed), Optimized vẫn #1 tuyệt đối cả 2 metric: avg 79.06 vs SQ 83.58 / FO 88.48; p90 134.75 vs SQ 162.16 / FO 173.24.
+
+**Vì sao (c) thất bại (trung thực):**
+- R10 vốn thắng seed 5 cực sát: Optimized 118.29/240.05 vs ShortestQueue 119.38/246.61 — biên chỉ 1.09 phút avg và 0.22 phút p90. Serving policy SRTF/aging giúp **SQ nhiều hơn hẳn** (avg 119.38 → 113.21, −6.17 phút) so với Optimized (118.29 → 116.81, −1.48 phút), vì SQ routing myopic để lại nhiều tour dài trong hàng đợi và SRTF/aging dọn chúng nhanh hơn. Lợi ích tuyệt đối của Optimized không đủ bù mức cải thiện của SQ → mất #1 dù điểm của chính Optimized tốt hơn R10.
+- Seed 123 p90: serving policy giúp FixedOrder rất mạnh (145.23 → 115.06) trong khi aging giữ Optimized ở 116.37. Chỉ SRTF thuần (K → ∞) mới đưa Optimized về 99.17 và giành #1 p90, nhưng khi đó seed 5 p90 vọt lên 277.42 (+15.6%) và fail (b). Đây là **biên trade-off** giữa bảo vệ tail seed 5 (cần aging) và lợi thế p90 seed 123 (cần SRTF thuần) — không có K nào trong dải đã thử thỏa cả hai.
+- Guard threshold cũng không giải được: T=20 cứu seed 123 p90 nhưng seed 5 p90 279.16 (+16.3%, fail (b)); T=0 (không guard) fail (c). K nhỏ (1/0.1) cũng không đưa baselines về FIFO vì giới hạn K→0 là `wait/tour`, không phải FIFO.
+- Kết luận cấu trúc: khi áp **cùng một serving policy cho cả 3 strategies**, tiêu chí (c) xung đột với việc sửa starvation trên seed 5; serving-only không thể vừa cải thiện tail của Optimized vừa giữ lợi thế tương đối trước baselines ở đúng những seed biên rất mỏng của R10.
+
+Live seed 99 (fresh dir, speed 5000): finished `t = 399.74754874492817` phút, 52/52, 188 visits; **78.1911 / 6.6557 / 150.9359 / 16.4670 / 11.0451** (avg_total/avg_wait/p90_total/p90_wait/avg_walk) — trùng khít R10/R13 live, xác nhận policy không đổi thứ tự trên seed này; learned stats dùng cho compare là cùng trạng thái. Lặp lại compare seed 42/7/123/5/2024 trên hai phiên bản chạy độc lập cho kết quả **bit-identical**.
+
+**Tests:**
+- `cargo test`: **80/80 pass** (74 test cũ + 6 mới; **1 test cũ đổi tên/expectation**).
+- Test cũ đổi: `urgent_patients_jump_ahead_of_normal_queue` → `urgent_patients_are_dispatched_ahead_of_normal_queue` — kiểm tra **thứ tự dispatch thực tế** (`[1, 3, 0]`, còn lại `[2]`) thay vì thứ tự vật lý của queue, vì policy mới cố ý giữ queue theo arrival order và áp priority tại dispatch (giống R13). Không test cũ nào khác bị sửa.
+- 6 test mới: (1) `aging_prioritizes_the_patient_who_waited_longer` — cùng tour, chờ lâu hơn được chọn; (2) `large_aging_k_reproduces_srtf_order` — K rất lớn, tour ngắn thắng dù vừa tới; (3) `small_aging_k_lets_a_long_waiting_long_tour_go_first` — K nhỏ, earlier long-tour thắng; (4) `urgent_dispatch_beats_any_aging_discount` — urgent vẫn trước normal dù normal được aging discount mạnh; (5) `aging_never_preempts_an_in_service_patient` — in-service không bị gián đoạn; (6) `aging_dispatch_order_is_deterministic` — hai world cùng seed/setup cho cùng dispatch order + queue state.
+
+**Files changed:** `backend/src/engine/sim.rs` (`AGING_K_MIN = 10`, `aging_k`, `remaining_tour_min`, `effective_tour_min`, `next_dispatch_index`, enqueue/dispatch mới, 6 test mới, 1 test cũ đổi expectation), `README.md` (mô tả serving policy + test count 80), `docs/rounds/README.md`. Không đổi `router.rs`, `congestion.rs`, `domain.rs`, `scenario.rs`, `stats.rs`, `learn.rs`, `api.rs`, `main.rs`, frontend.
+
+**Verify steps:**
+1. `cargo test`: 80/80 pass; `npm run build`: OK (frontend không đổi; chỉ warning chunk > 500 kB có từ trước).
+2. Fresh `MEDIROUTE_DATA_DIR=/tmp/mediroute-r14-test`, server riêng `PORT=8082`; live `{strategy:optimized, speed:5000, seed:99}` → finished 399.7475 phút, 52/52, 188 visits.
+3. `POST /api/sim/compare` seed 42 → 7 → 123 → 5 → 2024; ghi đủ avg_total/avg_wait/p90_total/avg_walk cho **cả 3 strategies**.
+4. Sweep K = 10/20/40, mỗi mức fresh data dir + live seed 99 + compare 5 seeds; thêm diagnostic K=5/1/0.1 và guard threshold T=20. Đo baseline R10 cho seed 5/123 trong worktree sạch tại HEAD.
+5. Port 8080 không đụng; **không git commit/push**.
+
+**Decision:** **KHÔNG COMMIT.** Round 14 sửa đúng lỗi starvation của R13: seed 5 p90 về đúng mức R10, không seed nào vi phạm guardrail, mean 5 seeds thắng R10 cả avg_total lẫn p90_total. Nhưng tiêu chí (c) thất bại vì serving policy giúp baselines nhiều hơn ở hai seed biên (seed 5 avg về ShortestQueue, seed 123 p90 về FixedOrder), và không có K/guard nào dung hòa được. Code giữ ở working tree với K=10 để coordinator verify độc lập; báo cáo trung thực, không commit.
+
+**Bài học:** (1) Aging giải quyết đúng starvation (R13 seed 5 +15.6% → R14 0.00%) mà vẫn giữ lợi ích tail ở seed 42 (−2.82%) — cơ chế `remaining / (1 + wait/K)` là đúng hướng. (2) Nhưng tiêu chí "Optimized vẫn #1 per-seed" không chỉ phụ thuộc Optimized: khi serving policy đổi cho mọi strategy, baselines cũng được lợi, và ở seed 5 R10 vốn chỉ hơn SQ 1.09 phút avg — mọi reordering SRTF-like đều giúp SQ nhiều hơn. (3) Có biên trade-off thật giữa seed 5 tail (cần aging) và seed 123 p90 (cần SRTF thuần); muốn đạt cả hai cần can thiệp khác (ví dụ policy riêng cho phòng capacity 1 vs 3, hoặc routing thay đổi để Optimized hưởng lợi không đối xứng), chứ không chỉ tune K. (4) K→0 của công thức không phải FIFO — giới hạn là `wait/tour`; muốn control FIFO phải viết nhánh policy riêng. (5) Bài học R12 được xác nhận: benchmark per-seed rất nhạy; cần 5 seeds và kiểm tra #1 per-seed, không chỉ mean.
+
+**Verify độc lập (coordinator):** cargo test 80/80; lặp quy trình chuẩn (fresh dir → live seed 99 → compare seeds 5 và 123): khớp chính xác — seed 5 Optimized 116.81 thua ShortestQueue 113.21 (avg), seed 123 Optimized p90 116.37 thua FixedOrder 115.06. Code reverted, cargo test 74/74.
+
+**Decision:** DISCARD — tiêu chí (c) của round (Optimized #1 cả 5 seeds) fail ở 2 ô. Nguyên nhân cấu trúc thú vị: serving policy tốt giúp MỌI strategies, nhưng giúp baselines NHIỀU HƠN Optimized (SQ −6.17 vs Optimized −1.48 trên seed 5 avg) vì Optimized đã tự cân bằng tải qua routing — phần lợi nhuận scheduling còn lại nhỏ hơn với strategy đã thông minh.
+
+**Kết luận chuỗi R13-R14:** serving policy (SRTF/aging) là hướng chết cho mục tiêu "Optimized tốt hơn baselines" — mọi cải thiện serving chia đều cho cả 3 strategies, phần phân biệt co lại. Hướng này chỉ có giá trị nếu mục tiêu đổi thành "cải thiện tuyệt đối toàn viện" (khi đó R14 K=10 là win: mean cả avg lẫn p90 tốt hơn, không seed regression). Patch có thể tái sử dụng từ docs.
