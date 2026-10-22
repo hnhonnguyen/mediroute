@@ -1007,3 +1007,105 @@ Seed 123:
 **Decision:** DISCARD — mean avg_total +2.81, p90 +5.55; không scale nào (0.4–1.2) tốt hơn R10.
 
 **Bài học:** heuristic anti-herding cũ không trùng lặp λ — nó projection hành vi của patients ĐÃ Ở TRONG hệ thống (in-process routing decisions), thứ λ không biết (λ chỉ mô hình arrivals từ ngoài). Thay thế = mất thông tin, không phải dedupe. Kết luận kiến trúc: 2 nguồn competitor là bổ sung: λ cho arrivals tương lai, heuristic cho internal patients; nếu tinh chỉnh sau này thì phải cộng cả hai.
+
+---
+
+## Round 12 — Room-load variance minimization (chỉ Optimized)
+
+**Status:** ⚠️ KHÔNG COMMIT — mọi biến thể (tie-break trong cost band và additive term) đều tệ hơn R10 ở mean 3 seed; code đã revert về đúng R10, chỉ giữ record.
+
+**Aspect đề xuất:**
+- R10 tối ưu từng quyết định theo `walk + est_wait + service + 0.5·lookahead`. `est_wait` chỉ thấy hàng đợi và công việc đã cam kết; hai phòng có cùng wait vẫn có thể đang tích tụ lượng việc rất khác nhau (nhiều job đang service, nhiều en-route, nhiều arrival λ sắp tới), đặc biệt ở phòng capacity 2–3.
+- Anti-herding (R1/R10) đếm competitor **cho phòng đang xét**; balance phải là tín hiệu **chéo phòng**: tránh cộng thêm việc vào phòng đã nặng kể cả khi wait hiện tại chưa phản ánh.
+- Yêu cầu round: projected load = facts + λ external trong window + internal routing projections (R11 đã chứng minh anti-herding là bắt buộc); aggregate theo capacity; tích hợp dưới dạng tie-break nhỏ trong band 25% **hoặc** additive term nhỏ; chỉ đổi Optimized; không đổi FixedOrder/ShortestQueue, sim, API/JSON, frontend, learning.
+- R10 reference Optimized: s42 64.07/2.91/77.79/11.51; s7 72.23/4.42/128.20/11.85; s123 72.29/6.60/116.37/10.81 (avg_total/avg_wait/p90_total/avg_walk).
+
+**Thiết kế (đã evaluate, sau đó revert):**
+
+*Projected total load (`router.rs::projected_total_load`):*
+```
+committed = Σ max(0, in_service_remaining)
+          + (queue_len + pending_starts + en_route) × est_service
+internal  = Σ weight của likely_arrivals có ready_in_min ≤ 30
+external  = E_r(now, now + 30)                 // ArrivalDemand R8
+load      = (committed + (internal + external) × est_service) / capacity
+```
+- Đơn vị: service-minutes per station. Biến thể `jobs_per_station` chia **số job** cho capacity thay vì nhân service (đã sweep, không thắng).
+- `in_service` không có remaining (fallback) được tính full một service; internal dùng nguyên heuristic R10; external dùng đúng room share của package.
+- Hai cách tích hợp:
+  1. **Tie-break** trong cost band hiện có (band sweep 0.05–0.25), thử tại các vị trí: sau walk, sau risk, sau downstream depth, sau en-route, sau queue. Gate tùy chọn: relative load tolerance, chênh wait tối đa, wait tuyệt đối tối đa.
+  2. **Additive**: `total_cost += α × load`, α sweep 0.002–0.2; band và tie-break chain R10 giữ nguyên.
+- 6 test mới đã viết và pass trong lúc evaluate: same cost → chọn phòng load thấp; ngoài cost band balance không được override; load = facts + λ + internal đúng số; baselines không đổi lựa chọn; distance vẫn thắng balance; single eligible room không đổi. Các test này được revert cùng code.
+
+**Sweep tie-break (window 30 phút, internal + λ, mean 3 seed 42/7/123):**
+
+| Cấu hình | s42 avg/p90 | s7 avg/p90 | s123 avg/p90 | Mean avg/p90 | Live s99 avg/p90 |
+|---|---|---|---|---|---|
+| R10 (ref) | 64.07/77.79 | 72.23/128.20 | 72.29/116.37 | **69.53/107.45** | 78.01/146.60 |
+| off control | 64.07/77.79 | 72.23/128.20 | 72.29/116.37 | 69.53/107.45 | 78.01/146.60 |
+| sau risk, band 25% | 66.43/88.38 | 72.71/130.55 | 78.64/124.16 | 72.59/114.37 | 81.07/139.48 |
+| sau depth, band 25% | 66.38/93.69 | 72.71/130.55 | 78.64/124.16 | 72.58/116.13 | 81.07/139.48 |
+| sau en-route, band 25% | 64.25/81.24 | 72.51/128.65 | 78.64/124.16 | **71.80/111.35** | 81.08/150.19 |
+| sau queue, band 25% | 64.25/81.24 | 72.51/128.65 | 78.64/124.16 | 71.80/111.35 | 81.08/150.19 |
+| sau risk, band 5% | 65.31/90.78 | 73.38/128.30 | 81.89/144.21 | 73.53/121.10 | 79.48/154.46 |
+| sau risk, band 10% | 64.94/82.93 | 73.32/128.20 | 81.73/140.25 | 73.33/117.13 | 79.38/154.46 |
+| sau risk, band 15% | 64.59/82.96 | 74.19/124.59 | 78.29/127.95 | 72.35/111.84 | 81.07/139.48 |
+| facts only (bỏ λ + internal) | 66.08/86.18 | 72.16/131.02 | 81.79/144.21 | 73.34/120.47 | 80.56/147.78 |
+| internal only (bỏ λ) | 65.61/93.69 | 72.71/130.55 | 78.64/124.16 | 72.32/116.13 | 81.81/155.22 |
+| λ external only (bỏ internal) | 66.10/94.60 | 73.42/124.59 | 78.64/124.16 | 72.72/114.45 | 81.08/150.19 |
+
+Các biến thể gate/aggregation (đều không thắng):
+
+| Cấu hình | s42 avg/p90 | s7 avg/p90 | s123 avg/p90 | Mean avg/p90 |
+|---|---|---|---|---|
+| sau en-route + wait gate ≤ 5 | 64.25/81.24 | 73.27/128.65 | 78.64/124.16 | 72.05/111.35 |
+| sau en-route + max wait ≤ 10 | 64.25/81.24 | 73.49/128.65 | 78.64/124.16 | 72.13/111.35 |
+| sau en-route + relative tol 25% | 64.94/85.59 | 72.44/124.41 | 78.64/124.16 | 72.01/111.38 |
+| jobs/station, sau risk | 65.94/90.78 | 73.35/124.59 | 78.64/124.16 | 72.64/113.18 |
+| jobs/station, sau en-route | 64.94/85.59 | 72.51/128.65 | 78.64/124.16 | 72.03/112.80 |
+| window 10 phút, sau en-route | 64.25/81.24 | 72.51/128.65 | 78.64/124.16 | 71.80/111.35 |
+
+**Sweep additive α (band + tie-break chain R10 giữ nguyên, balance tie-break tắt):**
+
+| α | s42 avg/p90 | s7 avg/p90 | s123 avg/p90 | Mean avg/p90 | Live s99 avg/p90 |
+|---|---|---|---|---|---|
+| 0.002 | 64.07/77.79 | 72.23/128.20 | 82.11/144.21 | 72.80/116.73 | 78.01/146.60 |
+| 0.005 | 64.07/77.79 | 72.23/128.20 | 82.11/144.21 | 72.80/116.73 | 78.01/146.60 |
+| 0.01 | 64.07/77.79 | 72.23/128.20 | 78.03/129.42 | **71.44/111.80** | 78.01/146.60 |
+| 0.02 | 64.58/83.04 | 72.23/128.20 | 79.35/131.24 | 72.05/114.16 | 77.47/143.53 |
+| 0.05 | 65.18/81.96 | 72.66/125.21 | 79.35/131.24 | 72.40/112.80 | 77.32/143.53 |
+| 0.1 | 64.66/82.98 | 72.64/124.92 | 79.48/131.24 | 72.26/113.05 | 83.17/174.16 |
+| 0.2 | 64.84/85.04 | 71.36/128.30 | 78.43/127.95 | 71.54/113.76 | 81.53/166.49 |
+
+**Đánh giá vs Round 10:**
+- Tie-break tốt nhất (sau en-route / sau queue, band 25%): mean avg 71.80 (**+2.27, +3.27%**), p90 111.35 (**+3.90, +3.63%**); live 81.08/150.19 vs 78.01/146.60. Tệ hơn ở cả hai tiêu chí.
+- Additive tốt nhất (α = 0.01): mean avg 71.44 (**+1.91, +2.75%**), p90 111.80 (**+4.35, +4.05%**); live trùng R10 nhưng s123 72.29/116.37 → 78.03/129.42. Tệ hơn ở cả hai tiêu chí.
+- Không cấu hình nào tốt hơn R10. s42 và s7 thường giữ nguyên hoặc xê dịch nhỏ; **s123 là nơi regression**: hầu hết tie-break variants rơi đúng vào cùng một path 78.64/124.16; band 5–10% và facts-only còn tệ hơn (81.7–81.9 avg / 140–144 p90); α = 0.002 cũng rơi vào 82.11/144.21. Nhiều cấu hình rất khác nhau hội tụ về cùng một path → một quyết định sớm bị đổi rồi cascade, không phải tối ưu liên tục.
+- α = 0.002 tương đương ~0.02 phút trên load ~10 phút/station vẫn đủ lật path s123; α = 0.005 cho kết quả y hệt α = 0.002 còn α = 0.01 lại khác → phản hồi rời rạc, xác nhận cơ chế đổi membership của cost band.
+- Baselines khớp **từng số** R10 ở cả 3 seed × 4 metric (s42 FO 77.0249/5.9134/130.2068/13.4523, SQ 71.3185/4.3273/103.8948/13.5720; s7 FO 84.3898/7.0846/138.8932/13.8233, SQ 77.8194/5.5577/139.7541/13.0962; s123 FO 86.4409/10.1679/145.2265/12.7288, SQ 81.0868/8.6726/126.7505/12.4931). Live seed 99 sau revert trùng khít R10: 78.0142/6.6068/146.5977/11.0451.
+
+**Vì sao thất bại (trung thực):**
+- 7/9 phòng capacity 1: "work per station" gần như trùng `est_wait + service`, nên tín hiệu load không thêm thông tin mà chỉ thêm nhiễu.
+- Với phòng capacity 2–3, phần load khác biệt nằm ở các job chưa tới (internal/λ); ưu tiên chênh lệch đó trong band 25% có thể vượt qua critical-path tie-break (unblocks/depth) đã tune từ R3–R10, làm hỏng tour tổng thể dù cục bộ "cân bằng" hơn.
+- Band 25% so sánh **theo tỉ lệ**, nên bất kỳ số hạng nào (kể cả ~0.02 phút) cũng đổi membership và cascade. "Nhỏ" về độ lớn không có nghĩa "nhỏ" về hành vi.
+- Muốn tối thiểu variance thực sự cần global assignment/batch hoặc objective hai mức; tie-break per-decision không phải điểm can thiệp đúng.
+
+**Files changed:** không còn thay đổi code — `backend/src/engine/router.rs` (implementation + sweep knobs tạm) và các file bị rustfmt trong lúc thử nghiệm đã revert về HEAD. Chỉ `docs/rounds/README.md` thêm section này. Patch của implementation đã evaluate được lưu ngoài repo tại `/tmp/r12-experiment.patch` để tham khảo; không commit.
+
+**Verify steps:**
+1. Trong lúc evaluate: `cargo test` **80/80 pass** (74 cũ + 6 mới). Sau revert: **74/74 pass**.
+2. `npm run build`: OK (frontend không đổi; chỉ warning chunk > 500 kB có từ trước).
+3. Fresh `MEDIROUTE_DATA_DIR=/tmp/mediroute-r12-test`, server riêng `PORT=8082`; live `{strategy:optimized, speed:5000, seed:99}` → finished 52/52, **78.0142/6.6068/146.5977/11.0451** (trùng R10).
+4. `POST /api/sim/compare` seed 42 → 7 → 123: Optimized **64.0700/2.9150/77.7868/11.5110; 72.2299/4.4230/128.1961/11.8492; 72.2939/6.5969/116.3665/10.8056** — đúng R10; baselines đúng từng số.
+5. Sweep: 10 cấu hình tie-break + 6 biến thể gate/aggregation + 7 giá trị α; mỗi cấu hình fresh dir riêng, live seed 99 + compare 42/7/123.
+6. Port 8080 không đụng; **không git commit/push**.
+
+**Decision:** **DISCARD — không commit.** Không cấu hình nào tốt hơn R10 trên avg_total hoặc p90_total (mean); mọi biến thể đều regression, nặng nhất ở seed 123. Working tree trở về đúng R10 (code) + record này.
+
+**Bài học:** Trong kiến trúc cost-band, thêm một tín hiệu bậc hai yếu dưới dạng tie-break "nhỏ" **không** hề nhỏ: nó đổi membership của band và cascade sang các quyết định sau. Additive term cũng vậy — α = 0.002 (≈0.02 phút) đủ lật một path. Cross-room load phần lớn đã nằm trong `est_wait + lookahead` ở phòng capacity 1; ở phòng capacity lớn, chênh lệch work-per-station chỉ xuất hiện trong transient và ưu tiên nó phá thứ tự critical-path đã tune. Nếu muốn tối thiểu variance, phải đổi điểm can thiệp (global/batch objective), không phải thêm một khóa tie-break vào greedy per-patient. Bài học phụ: benchmark 3 seed rất nhạy — một flip sớm ở s123 chi phối toàn bộ mean; các sweep cần thêm seed để phân biệt "tín hiệu yếu" với "nhiễu cascade".
+
+**Verify độc lập (coordinator):** repo sạch sau self-revert của agent (chỉ docs còn modified), cargo test 74/74 — HEAD code vẫn là R10. Agent đã evaluate 2 hướng (tie-break nhiều vị trí + additive α sweep 0.002–0.2) với 6 test mới pass trong lúc evaluate; mọi cấu hình tệ hơn R10 (mean avg +1.91 đến +2.27). Patch thử nghiệm lưu /tmp/r12-experiment.patch.
+
+**Decision:** DISCARD — mọi biến thể regression. Chẩn đoán quan trọng: load signal phần lớn TRÙNG thông tin đã có trong est_wait + lookahead (hai thứ đã aggregate cùng facts + λ + internal projection); cost band 25% rất nhạy (α=0.002 đã đủ lật quyết định). Muốn giảm variance thật sự phải đổi điểm can thiệp (global/batch objective) — hướng batch đã fail ở R2.
+
+**Bài học chuỗi (R2, R12):** per-decision router đã bão hòa tại local optimum — mọi can thiệp local (batch window, balance tie-break, additive load) đều regress vì phá cấu trúc cost đã tune. Các hướng còn hứa hẹn: thay đổi PHỤC VỤ (scheduling trong phòng — ví dụ service order theo remaining-tour thay vì FIFO), hoặc thay đổi KỊCH BẢN (nhiều capacity/rooms) rồi đo lại.
