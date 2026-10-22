@@ -13,10 +13,18 @@ pub const SECONDARY_PEAK_START_MIN: f64 = 150.0;
 pub const SECONDARY_PEAK_END_MIN: f64 = 210.0;
 pub const PRIMARY_PEAK_SHARE: f64 = 0.65;
 
-/// Each room has this chance of one unplanned outage per run.
+/// Each room has this chance of one unplanned outage per run. A scheduled
+/// outage starts uniformly in `[DOWNTIME_EARLIEST_START_MIN, latest_start)`.
 pub const DOWNTIME_PROBABILITY: f64 = 0.15;
 pub const DOWNTIME_MIN_MIN: f64 = 10.0;
 pub const DOWNTIME_MAX_MIN: f64 = 20.0;
+pub const DOWNTIME_EARLIEST_START_MIN: f64 = 15.0;
+
+/// Latest minute at which a seeded outage can begin. This is the published
+/// policy window, not a particular RNG draw.
+pub fn downtime_latest_start_min() -> f64 {
+    (DEFAULT_ARRIVAL_WINDOW_MIN * 0.8 - DOWNTIME_MAX_MIN).max(DOWNTIME_EARLIEST_START_MIN)
+}
 
 /// Percentage of patients who receive expedited queue treatment.
 pub const URGENT_PATIENT_SHARE: f64 = 0.10;

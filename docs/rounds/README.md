@@ -777,3 +777,121 @@ Cold compare: mean avg_total −1.94 (−2.66%), p90_total −7.58 (−6.49%); s
 **Decision:** DISCARD — regression end-to-end rõ rệt sau warm-up (+4.59% avg, +10.38% p90 mean 3 seeds). Control α=0.3 của agent tái tạo R8 bit-identical, xác nhận nguyên nhân nhân quả.
 
 **Bài học:** α adaptive chỉ thắng ở cold-start thuần (first-run MAE tốt hơn 16×) nhưng trong quy trình có warm-up, α thấp khi warm làm estimate bám dịch chậm — service mean không đổi trong ngày nên tracking nhanh hơn không mang lợi, chỉ mang noise. α = 0.3 cố định là điểm cân bằng tốt cho workload tĩnh.
+
+---
+
+## Round 10 — Downtime-aware routing (chỉ Optimized)
+
+**Status:** ✅ COMMITTED (verified độc lập — win nhỏ, không regression)
+
+**Aspect đề xuất:**
+- Router đã nhận `downtime_remaining_min` nhưng chi phí bước kế tiếp vẫn tính wait tại `now`: `walk + est_wait(now) + service`. Khi phòng đang down, cách tính này vừa over-charge phần walk (bệnh nhân chưa tới nơi) vừa bỏ qua việc phòng có thể mở cửa trước khi bệnh nhân tới.
+- Round 10 yêu cầu: (1) tính remaining downtime chính xác vào slot sớm nhất; (2) không charge downtime nếu nó kết thúc trước lúc bệnh nhân tới; (3) risk model chỉ dùng thông tin quá khứ/hiện tại (outage đã xảy ra, remaining downtime hiện tại), **không đọc RNG/future schedule**; (4) chỉ đổi Optimized, giữ nguyên FixedOrder/ShortestQueue, sim physics, API/JSON, frontend và learning.
+
+**Cơ chế downtime thực tế (đọc từ code, không giả định):**
+
+`sim.rs::schedule_downtime_windows` chạy đúng một lần trong `World::new`:
+```rust
+let latest_start = downtime_latest_start_min();
+for room in 0..self.scenario_rooms.len() {
+    if !rng.gen_bool(DOWNTIME_PROBABILITY) {
+        continue;
+    }
+    let start = rng.gen_range(DOWNTIME_EARLIEST_START_MIN..latest_start);
+    let duration = rng.gen_range(DOWNTIME_MIN_MIN..DOWNTIME_MAX_MIN);
+    self.schedule(start, Event::RoomDowntimeStart { room, duration_min: duration });
+}
+```
+- Xác suất 15% mỗi phòng; start uniform trong `[15, 148)` (`latest = 210·0.8 − 20`); duration 10–20 phút.
+- `RoomDowntimeStart` đặt `down_until = now + duration`, tăng `downtime_episodes`, schedule `RoomDowntimeEnd`. Patient **đang service kết thúc bình thường**; `dispatch_room` từ chối start service mới khi `now < down_until`; `RoomDowntimeEnd` xoá `down_until` rồi dispatch lại queue.
+- Vì schedule chỉ chạy một lần, mỗi phòng có **tối đa một outage/run**. Test mới quét 60 seeds xác nhận mọi start nằm trong `[15, 148)` và không phòng nào có 2 start.
+- Thay đổi trong `sim.rs` chỉ là **additive telemetry**: thêm `RoomState.downtime_episodes` (đếm outage đã bắt đầu) và dùng chung hàm `downtime_latest_start_min()` với router. Không thêm/bớt RNG call, không đổi thứ tự RNG, không đổi physics → stream seed và hành vi baselines giữ nguyên.
+
+**Thiết kế:**
+
+*Cost tại thời điểm arrival (`congestion.rs` + `router.rs`):*
+- `est_wait_at_arrival_min(load, service, capacity, arrive_in)` dựng station free-times `max(in_service_remaining, downtime_remaining)`, đổ queue/pending/en-route/likely-arrivals, trả `max(0, min_station − arrive_in)`.
+- `wait_at(room)` dùng hàm này **chỉ khi** `downtime_remaining_min > 0`; phòng không downtime giữ `est_wait_min` như R8. Vì vậy:
+  - downtime còn 2 phút, walk 3.5 → wait 0 (mở cửa trước khi tới);
+  - downtime còn 12 phút, walk 3.5 → wait 8.5 (chỉ phần overlap sau arrival);
+  - queue hình thành sau reopen vẫn được tính đủ.
+- Ghi nhận trung thực: `est_wait_min` và `future_wait_min` **đã** cộng downtime chính xác từ trước bằng floor `max(in_service_remaining, downtime)`; không cần sửa. Lỗi duy nhất là first-step wait-from-now cộng thêm walk.
+- Thử mở rộng arrival-time pricing cho **mọi** phòng (không chỉ phòng đang down), risk tắt: seed 42 64.68/81.47, seed 7 72.39/132.45, seed 123 80.87/132.18 (avg/p90) → mean 72.65/115.36, tệ hơn R8 69.83/107.45. Giữ phạm vi hẹp đúng downtime.
+
+*Risk (`router.rs`):*
+- `RoomLoad.downtime_episodes` (từ telemetry trên) cho biết phòng đã dùng outage duy nhất chưa.
+- `downtime_risk(room)`:
+  - `episodes > 0` → `0` (đã hết outage, an toàn đến cuối run);
+  - `now ≥ 148` → `0` (cửa sổ start đã đóng);
+  - `now ≤ 15` → `0.15`;
+  - ngược lại dùng posterior Bayes, conditional trên việc chưa thấy outage nào:
+    `0.15 · (148 − now)/133 / (1 − 0.15 · (now − 15)/133)`.
+  - Không đọc event heap, seed hay RNG; chỉ dùng episode đã quan sát + policy công khai.
+- **Cách dùng:** risk là tie-break **sau walk** trong tie-band 25%, không phải additive cost. Các biến thể đã đo:
+  - additive `+risk·est_service·0.1` (đúng gợi ý): seed 42/7 bit-identical R8, nhưng seed 123 72.29→78.03 avg / 116.37→129.42 p90; mean +1.9 avg / +4.4 p90 → loại.
+  - additive `0.01`: seed 123 còn tệ hơn (81.17/144.21). Một lượng rất nhỏ vẫn đủ đổi membership của tie-band và cascade sang các quyết định sau → loại.
+  - risk trước walk: kéo avg_walk lên (seed 42 11.51→12.93; seed 123 10.81→12.74), mean avg 72.62 → loại.
+  - risk sau walk nhưng nhân `est_service`: vẫn đổi thứ hạng theo service ở các cặp walk bằng nhau (nhiều phòng bị clamp 5.0 từ entrance), mean avg 71.10 → loại.
+  - **chọn:** risk sau walk, chỉ phân biệt spent vs unspent (không nhân service). Các phòng chưa outage có cùng risk tại cùng thời điểm; chỉ lịch sử outage mới đổi thứ hạng.
+- Tie-break order cuối: cost band 25% → walk → **downtime risk** → unblocks → downstream depth → en-route → queue → package position.
+
+**Kết quả compare (verify chuẩn: fresh dir → live seed 99 → compare 42/7/123):**
+
+Seed 42:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized (R10)** | **64.07** | **2.91** | **77.79** | **11.51** |
+| Optimized (R8) | 64.07 | 2.91 | 77.79 | 11.51 |
+| FixedOrder | 77.02 | 5.91 | 130.21 | 13.45 |
+| ShortestQueue | 71.32 | 4.33 | 103.89 | 13.57 |
+
+Seed 7:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized (R10)** | **72.23** | **4.42** | **128.20** | **11.85** |
+| Optimized (R8) | 73.13 | 4.68 | 128.20 | 11.76 |
+| FixedOrder | 84.39 | 7.08 | 138.89 | 13.82 |
+| ShortestQueue | 77.82 | 5.56 | 139.75 | 13.10 |
+
+Seed 123:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized (R10)** | **72.29** | **6.60** | **116.37** | **10.81** |
+| Optimized (R8) | 72.29 | 6.60 | 116.37 | 10.81 |
+| FixedOrder | 86.44 | 10.17 | 145.23 | 12.73 |
+| ShortestQueue | 81.09 | 8.67 | 126.75 | 12.49 |
+
+**Đánh giá vs Round 8 (Optimized):**
+
+| Seed | Δ avg_total | Δ avg_wait | Δ p90_total | Δ avg_walk |
+|---|---|---|---|---|
+| 42 | 0 | 0 | 0 | 0 |
+| 7 | −0.90 (−1.23%) | −0.26 (−5.51%) | 0 | +0.09 (+0.72%) |
+| 123 | 0 | 0 | 0 | 0 |
+| **Mean 3 seed** | **−0.30 (−0.43%)** | **−0.09 (−1.82%)** | **0** | **+0.03 (+0.25%)** |
+
+- Đạt tiêu chí round: mean avg_total tốt hơn, p90_total không đổi, **không seed nào regress**. Lợi ích tập trung ở seed 7: một vài quyết định near-tie chọn phòng đã hết outage thay vì phòng còn risk, giảm cả avg_total lẫn avg_wait; walk tăng 0.085 phút nhưng nhỏ hơn mức giảm total.
+- Baselines khớp **từng số** với R8 ở cả 3 seed × 4 metric (77.0249/5.9134/130.2068/13.4523; 71.3185/4.3273/103.8948/13.5720; 84.3898/7.0846/138.8932/13.8233; 77.8194/5.5577/139.7541/13.0962; 86.4409/10.1679/145.2265/12.7288; 81.0868/8.6726/126.7505/12.4931).
+
+Live seed 99 (fresh dir, speed 5000): finished `t = 399.74754874492817` phút, 52/52, 188 visits; **78.0142 / 6.6068 / 146.5977 / 16.4670 / 11.0451** (avg_total/avg_wait/p90_total/p90_wait/avg_walk) — **trùng khít R8**, xác nhận live routing không bị risk tie-break đổi trên seed này và learned stats dùng cho compare là cùng một trạng thái.
+
+**Files changed:** `backend/src/scenario.rs` (`DOWNTIME_EARLIEST_START_MIN`, `downtime_latest_start_min()` dùng chung, hành vi không đổi), `backend/src/engine/sim.rs` (`RoomState.downtime_episodes` + expose trong `room_loads`; chỉ telemetry, RNG/physics không đổi; 2 test), `backend/src/engine/congestion.rs` (`projected_wait_at` refactor + `est_wait_at_arrival_min`; 4 test), `backend/src/engine/router.rs` (`RoomLoad.downtime_episodes`, `wait_at` arrival-time cho phòng đang down, `downtime_risk` posterior, risk tie-break sau walk; 4 test), `docs/rounds/README.md`. Không đổi FixedOrder/ShortestQueue, cơ chế downtime của sim, priority queue, `learn.rs`, API/JSON, frontend.
+
+**Verify steps:**
+1. `cargo test`: **74/74 pass** (64 test cũ + 10 mới: 2 sim — cửa sổ outage bounded/không lặp qua 60 seeds, load giữ episode sau reopen; 4 congestion — short downtime rẻ hơn long, hết downtime trước arrival không bị charge, wait dùng đúng reopen time, queue sau reopen vẫn tính; 4 router — cost tại arrival time, risk theo history + cửa sổ start, risk chỉ phá tie sau walk, baselines không đổi lựa chọn).
+2. `npm run build`: OK (frontend không đổi; chỉ warning chunk > 500 kB có từ trước).
+3. Fresh `MEDIROUTE_DATA_DIR=/tmp/mediroute-r10-test`, server riêng `PORT=8082`; live `{strategy:optimized, speed:5000, seed:99}` → finished 399.75 phút, 52/52, 188 visits, metrics trùng R8.
+4. `POST /api/sim/compare` seed 42 → 7 → 123; ghi đủ 4 metric cho 3 strategies; xác nhận baselines khớp R8 từng số.
+5. Sweep chẩn đoán: additive risk 0.1 / 0.01, arrival-time wait cho mọi phòng, risk trước walk, risk sau walk có service factor — tất cả đều tệ hơn; chỉ spent-vs-unspent sau walk thắng.
+6. Port 8080 không đụng; không git commit/push.
+
+**Decision:** **WIN NHỎ — không commit** theo yêu cầu round. Mean 3 seed cải thiện avg_total (−0.43%) và avg_wait (−1.82%), p90_total không đổi, không seed nào tệ hơn; baselines và live seed 99 bit-identical R8. Working tree giữ code + docs để coordinator verify độc lập.
+
+**Bài học:** với cơ chế "mỗi phòng tối đa một outage 10–20 phút", risk tương lai là rất nhỏ (posterior ≈ 0.06–0.15, expected delay cỡ 0.2 phút), nên không đủ sức đổi route có ý nghĩa. Đưa risk thành additive cost còn **có hại** vì tie-band 25% so sánh theo tỉ lệ: một khoản 0.01–0.2 phút đủ làm đổi membership của band và cascade. Bài học tổng quát: trong kiến trúc cost-band, thông tin có độ tin cậy thấp phải là tie-break muộn, không phải số hạng cộng; và một risk model trung thực phải phân biệt "đã hết outage" với "chưa outage", nhưng không được tự bịa thêm thứ hạng theo service khi các phòng đều chưa outage.
+
+**Verify độc lập (coordinator):** cargo test 74/74; lặp quy trình chuẩn (fresh dir → live seed 99 → compare 42/7/123): khớp chính xác — seed 7 cải thiện 73.13→72.23 avg_total / 4.68→4.42 avg_wait; seeds 42/123 giữ nguyên từng số; baselines không đổi.
+
+**Decision:** COMMIT — mean avg_total −0.43%, không regression per-seed, và sửa đúng mô hình: wait giờ được đánh giá tại thời điểm patient dự kiến TỚI (downtime kết thúc trước arrival không còn bị phạt), risk Bayesian hậu nghiệm chỉ dùng tie-break muộn.

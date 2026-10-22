@@ -11,9 +11,9 @@ use crate::domain::{
     Scenario, VisitRecord, ENTRANCE_ID, ENTRANCE_POSITION, WALK_TIME_MIN,
 };
 use crate::scenario::{
-    ArrivalDemand, DEFAULT_ARRIVAL_WINDOW_MIN, DOWNTIME_MAX_MIN, DOWNTIME_MIN_MIN,
-    DOWNTIME_PROBABILITY, PRIMARY_PEAK_END_MIN, PRIMARY_PEAK_SHARE, PRIMARY_PEAK_START_MIN,
-    SECONDARY_PEAK_END_MIN, SECONDARY_PEAK_START_MIN, URGENT_PATIENT_SHARE,
+    downtime_latest_start_min, ArrivalDemand, DOWNTIME_EARLIEST_START_MIN, DOWNTIME_MAX_MIN,
+    DOWNTIME_MIN_MIN, DOWNTIME_PROBABILITY, PRIMARY_PEAK_END_MIN, PRIMARY_PEAK_SHARE,
+    PRIMARY_PEAK_START_MIN, SECONDARY_PEAK_END_MIN, SECONDARY_PEAK_START_MIN, URGENT_PATIENT_SHARE,
 };
 
 use super::congestion;
@@ -133,6 +133,8 @@ struct RoomState {
     busy_min: f64,
     visits: usize,
     down_until: Option<f64>,
+    /// Outages that have already started in this run.
+    downtime_episodes: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +224,7 @@ impl World {
                 busy_min: 0.0,
                 visits: 0,
                 down_until: None,
+                downtime_episodes: 0,
             })
             .collect();
 
@@ -611,6 +614,7 @@ impl World {
             }
             Event::RoomDowntimeStart { room, duration_min } => {
                 let until = self.now + duration_min.max(0.0);
+                self.rooms[room].downtime_episodes += 1;
                 self.rooms[room].down_until = Some(until);
                 self.schedule(until, Event::RoomDowntimeEnd { room });
             }
@@ -623,12 +627,12 @@ impl World {
 
     /// Each room independently may take one unplanned 10-20 minute outage.
     fn schedule_downtime_windows(&mut self, rng: &mut StdRng) {
-        let latest_start = (DEFAULT_ARRIVAL_WINDOW_MIN * 0.8 - DOWNTIME_MAX_MIN).max(15.0);
+        let latest_start = downtime_latest_start_min();
         for room in 0..self.scenario_rooms.len() {
             if !rng.gen_bool(DOWNTIME_PROBABILITY) {
                 continue;
             }
-            let start = rng.gen_range(15.0..latest_start);
+            let start = rng.gen_range(DOWNTIME_EARLIEST_START_MIN..latest_start);
             let duration = rng.gen_range(DOWNTIME_MIN_MIN..DOWNTIME_MAX_MIN);
             self.schedule(
                 start,
@@ -753,6 +757,7 @@ impl World {
                     .down_until
                     .map(|until| (until - self.now).max(0.0))
                     .unwrap_or(0.0);
+                load.downtime_episodes = state.downtime_episodes;
             }
         }
         for patient in &self.patients {
@@ -1218,5 +1223,64 @@ mod tests {
             .sum::<f64>()
             / world.patients.len() as f64;
         assert!((metrics.avg_walk_min - manual).abs() < 1e-9);
+    }
+
+    #[test]
+    fn seeded_downtime_windows_are_bounded_and_never_repeat_per_room() {
+        for seed in 0..60 {
+            let world = demo_world(Strategy::Optimized, seed, DEFAULT_PATIENT_COUNT);
+            let mut starts: HashMap<usize, usize> = HashMap::new();
+            for event in world.events.iter() {
+                if let Event::RoomDowntimeStart { room, duration_min } = &event.event {
+                    *starts.entry(*room).or_default() += 1;
+                    assert!(
+                        event.at >= DOWNTIME_EARLIEST_START_MIN,
+                        "seed {seed}: outage before the start window"
+                    );
+                    assert!(
+                        event.at < downtime_latest_start_min(),
+                        "seed {seed}: outage after the start window"
+                    );
+                    assert!(*duration_min >= DOWNTIME_MIN_MIN);
+                    assert!(*duration_min < DOWNTIME_MAX_MIN);
+                }
+            }
+            assert!(
+                starts.values().all(|count| *count <= 1),
+                "seed {seed} scheduled more than one outage for a room: {starts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn room_loads_track_outage_history_after_reopening() {
+        let mut world = demo_world(Strategy::Optimized, 11, 4);
+        let room_id = world.scenario_rooms[0].id.clone();
+
+        {
+            let loads = world.room_loads(None);
+            let load = loads.get(&room_id).expect("room load");
+            assert_eq!(load.downtime_episodes, 0);
+            assert_eq!(load.downtime_remaining_min, 0.0);
+        }
+
+        world.handle_event(Event::RoomDowntimeStart {
+            room: 0,
+            duration_min: 12.0,
+        });
+        {
+            let loads = world.room_loads(None);
+            let load = loads.get(&room_id).expect("room load");
+            assert_eq!(load.downtime_episodes, 1);
+            assert!((load.downtime_remaining_min - 12.0).abs() < 1e-9);
+        }
+
+        world.handle_event(Event::RoomDowntimeEnd { room: 0 });
+        {
+            let loads = world.room_loads(None);
+            let load = loads.get(&room_id).expect("room load");
+            assert_eq!(load.downtime_episodes, 1, "history survives reopening");
+            assert_eq!(load.downtime_remaining_min, 0.0);
+        }
     }
 }

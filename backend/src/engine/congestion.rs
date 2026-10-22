@@ -35,6 +35,36 @@ pub fn est_wait_min(load: &RoomLoad, est_service_min: f64, capacity: usize) -> f
     }
 }
 
+/// Projected wait for a patient who reaches `room` `arrive_in_min` from now.
+/// The station backlog is identical to `est_wait_min`, but a station that is
+/// already free when the patient arrives costs no wait. In particular, an
+/// outage that ends before the patient reaches the room is not charged, while
+/// a long outage still floors the earliest usable station at its reopening.
+pub fn est_wait_at_arrival_min(
+    load: &RoomLoad,
+    est_service_min: f64,
+    capacity: usize,
+    arrive_in_min: f64,
+) -> f64 {
+    let arrive = arrive_in_min.max(0.0);
+    let base = projected_wait_at(load, est_service_min, capacity, 0, arrive);
+    // Once the patient's projected start is known, competitors that become
+    // free before that moment can still slip ahead in the queue.
+    let start_from_now = arrive + base;
+    let expected_extra: f64 = load
+        .likely_arrivals
+        .iter()
+        .filter(|arrival| arrival.ready_in_min <= start_from_now)
+        .map(|arrival| arrival.weight.max(0.0))
+        .sum();
+    let extra_jobs = expected_extra.ceil() as usize;
+    if extra_jobs == 0 {
+        base
+    } else {
+        projected_wait_at(load, est_service_min, capacity, extra_jobs, arrive)
+    }
+}
+
 /// Projected wait for a patient who arrives `horizon_min` from now. The
 /// current cohort keeps the station model of `est_wait_min`, while expected
 /// arrivals from the scenario demand model consume a station at their arrival
@@ -128,6 +158,16 @@ fn projected_wait(
     capacity: usize,
     extra_jobs: usize,
 ) -> f64 {
+    projected_wait_at(load, est_service_min, capacity, extra_jobs, 0.0)
+}
+
+fn projected_wait_at(
+    load: &RoomLoad,
+    est_service_min: f64,
+    capacity: usize,
+    extra_jobs: usize,
+    arrive_in_min: f64,
+) -> f64 {
     let service = est_service_min.max(0.0);
     let capacity = capacity.max(1);
     let downtime = load.downtime_remaining_min.max(0.0);
@@ -154,11 +194,11 @@ fn projected_wait(
         stations[idx] += service;
     }
 
-    stations
+    let earliest = stations
         .iter()
         .copied()
-        .fold(f64::INFINITY, f64::min)
-        .max(0.0)
+        .fold(f64::INFINITY, f64::min);
+    (earliest - arrive_in_min.max(0.0)).max(0.0)
 }
 
 #[cfg(test)]
@@ -384,5 +424,59 @@ mod tests {
         assert!((future_wait_min(&room, 10.0, 1, None, "a", 0.0, 0.0) - 15.0).abs() < 1e-9);
         assert!((future_wait_min(&room, 10.0, 1, None, "a", 0.0, 10.0) - 5.0).abs() < 1e-9);
         assert_eq!(future_wait_min(&room, 10.0, 1, None, "a", 0.0, 15.0), 0.0);
+    }
+
+    #[test]
+    fn downtime_that_ends_before_arrival_is_not_charged() {
+        let mut room = load(0, &[], 0, 0);
+        room.downtime_remaining_min = 3.0;
+        // A five-minute walk reaches the room after it reopens.
+        assert_eq!(est_wait_at_arrival_min(&room, 10.0, 1, 5.0), 0.0);
+        // A two-minute walk still catches the last minute of the outage.
+        assert!((est_wait_at_arrival_min(&room, 10.0, 1, 2.0) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn shorter_remaining_downtime_has_a_lower_arrival_cost() {
+        let mut short = load(0, &[], 0, 0);
+        short.downtime_remaining_min = 2.0;
+        let mut long = load(0, &[], 0, 0);
+        long.downtime_remaining_min = 12.0;
+        let cost = |room: &RoomLoad| {
+            let walk = 4.0;
+            walk + est_wait_at_arrival_min(room, 10.0, 1, walk) + 10.0
+        };
+        // The short outage ends before the walk does; the long one leaves an
+        // eight-minute wait on arrival.
+        assert!((cost(&short) - 14.0).abs() < 1e-9);
+        assert!((cost(&long) - 22.0).abs() < 1e-9);
+        assert!(cost(&short) < cost(&long));
+    }
+
+    #[test]
+    fn arrival_wait_uses_the_exact_reopen_time() {
+        // The in-service patient frees the station at minute 3, but the room
+        // stays offline until minute 12: the first usable station is exactly 12.
+        let mut room = load(0, &[3.0], 0, 0);
+        room.downtime_remaining_min = 12.0;
+        assert!((est_wait_at_arrival_min(&room, 10.0, 1, 0.0) - 12.0).abs() < 1e-9);
+        assert!((est_wait_at_arrival_min(&room, 10.0, 1, 2.0) - 10.0).abs() < 1e-9);
+        assert_eq!(est_wait_at_arrival_min(&room, 10.0, 1, 15.0), 0.0);
+        // With no background demand this matches the horizon-aware model.
+        assert!(
+            (est_wait_at_arrival_min(&room, 10.0, 1, 5.0)
+                - future_wait_min(&room, 10.0, 1, None, "a", 0.0, 5.0))
+            .abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
+    fn arrival_wait_counts_queue_jobs_after_reopening() {
+        let mut room = load(1, &[], 0, 0);
+        room.downtime_remaining_min = 2.0;
+        // The queued patient occupies the station from minute 2 to 12. The
+        // newcomer arrives at minute 5 and waits 7.
+        assert!((est_wait_at_arrival_min(&room, 10.0, 1, 5.0) - 7.0).abs() < 1e-9);
     }
 }

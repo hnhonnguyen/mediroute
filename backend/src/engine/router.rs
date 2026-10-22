@@ -4,7 +4,9 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{walk_time, DependencyGraph, Room, RoomStats, ENTRANCE_ID, ENTRANCE_POSITION, WALK_TIME_MIN};
-use crate::scenario::ArrivalDemand;
+use crate::scenario::{
+    downtime_latest_start_min, ArrivalDemand, DOWNTIME_EARLIEST_START_MIN, DOWNTIME_PROBABILITY,
+};
 
 use super::congestion;
 
@@ -17,6 +19,12 @@ const COST_TIE_BAND: f64 = 0.25;
 /// A sub-1.0 factor keeps the second step informative without letting a busy
 /// next room dominate the immediate wait. Tuned on seeds 42/7/123.
 const LOOKAHEAD_WEIGHT: f64 = 0.5;
+
+// Round 10 keeps outage risk as a late tie-break: the demo policy allows at
+// most one outage per room, so a room that has already started its outage is
+// risk-free for the rest of the run. Pricing the risk directly into the cost
+// shifted 25% tie-band membership and regressed the benchmark, so it only
+// settles equal-walk near-ties.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -68,6 +76,10 @@ pub struct RoomLoad {
     pub likely_arrivals: Vec<ExpectedArrival>,
     /// Minutes until the room reopens after an unplanned outage.
     pub downtime_remaining_min: f64,
+    /// Outages this room has already started during the run (finished or
+    /// ongoing). The demo policy allows at most one per room, so a positive
+    /// count means no further outage is pending.
+    pub downtime_episodes: u32,
 }
 
 pub struct RouteContext<'a> {
@@ -184,7 +196,46 @@ impl RouteContext<'_> {
     }
 
     fn wait_at(&self, room: &str) -> f64 {
-        congestion::est_wait_min(&self.load(room), self.est_service(room), self.capacity(room))
+        let load = self.load(room);
+        let service = self.est_service(room);
+        let capacity = self.capacity(room);
+        if load.downtime_remaining_min > 0.0 {
+            // The patient is still walking. If the room reopens before they
+            // arrive, only the queue ahead of them can make them wait.
+            congestion::est_wait_at_arrival_min(
+                &load,
+                service,
+                capacity,
+                self.walk_to(room),
+            )
+        } else {
+            congestion::est_wait_min(&load, service, capacity)
+        }
+    }
+
+    /// Probability that this room's one allowed outage is still ahead, given
+    /// that no outage has been observed yet. Uses only the observed episode
+    /// history and the published policy (15% chance, start uniform in
+    /// `[earliest, latest)`); the seeded schedule itself is never read. A room
+    /// that already started its outage is risk-free for the rest of the run.
+    fn downtime_risk(&self, room: &str) -> f64 {
+        let load = self.load(room);
+        if load.downtime_episodes > 0 {
+            return 0.0;
+        }
+        let earliest = DOWNTIME_EARLIEST_START_MIN;
+        let latest = downtime_latest_start_min();
+        if self.now_min >= latest {
+            return 0.0;
+        }
+        if self.now_min <= earliest {
+            return DOWNTIME_PROBABILITY;
+        }
+        // Bayes: P(scheduled and starting later | no outage so far).
+        let window = latest - earliest;
+        let future_share = (latest - self.now_min) / window;
+        let survived = 1.0 - DOWNTIME_PROBABILITY * (self.now_min - earliest) / window;
+        DOWNTIME_PROBABILITY * future_share / survived
     }
 
     /// Projected wait when arriving at `room` in `arrive_in_min` minutes. The
@@ -311,6 +362,17 @@ impl RouteContext<'_> {
         let walk_order = walk_a.total_cmp(&walk_b);
         if walk_order != Ordering::Equal {
             return walk_order;
+        }
+
+        // Only after distance ties: a room whose one allowed outage has not
+        // happened yet still carries a small expected delay. Pricing this
+        // before distance regressed the walk time, so it stays a late
+        // tie-break rather than an additive cost.
+        let risk_a = self.downtime_risk(room_a);
+        let risk_b = self.downtime_risk(room_b);
+        let risk_order = risk_a.total_cmp(&risk_b);
+        if risk_order != Ordering::Equal {
+            return risk_order;
         }
 
         let unblocks_a = self.unblocks(room_a, required, done);
@@ -1008,6 +1070,180 @@ mod tests {
         assert_eq!(
             ctx.next_room(Strategy::ShortestQueue, &required, &[]),
             Some("x".to_string())
+        );
+    }
+
+    fn cost_context<'a>(
+        rooms: &'a [Room],
+        graph: &'a DependencyGraph,
+        stats: &'a HashMap<String, RoomStats>,
+        loads: &'a HashMap<String, RoomLoad>,
+        now: f64,
+    ) -> RouteContext<'a> {
+        RouteContext {
+            rooms,
+            graph,
+            stats,
+            loads,
+            current_location: ENTRANCE_ID,
+            demand: None,
+            now_min: now,
+        }
+    }
+
+    fn cost_for(ctx: &RouteContext, room: &str) -> f64 {
+        let required = vec![room.to_string()];
+        let required_set: HashSet<&str> = required.iter().map(String::as_str).collect();
+        ctx.total_cost(room, &required_set, &HashSet::new())
+    }
+
+    #[test]
+    fn optimized_prices_downtime_at_the_arrival_time() {
+        // Both rooms sit at the same position, so walk time is identical.
+        let rooms = vec![
+            room_at("soon", 10.0, 1, (10.0, 0.0)),
+            room_at("late", 10.0, 1, (10.0, 0.0)),
+        ];
+        let graph = graph(&rooms, &[]);
+        let stats = stats(&rooms, &[]);
+        let mut loads = HashMap::new();
+        for id in ["soon", "late"] {
+            loads.insert(
+                id.to_string(),
+                RoomLoad {
+                    // Already down: the one allowed outage is spent, so the
+                    // risk term is zero for both rooms.
+                    downtime_episodes: 1,
+                    ..RoomLoad::default()
+                },
+            );
+        }
+        loads
+            .get_mut("soon")
+            .expect("soon load")
+            .downtime_remaining_min = 2.0;
+        loads
+            .get_mut("late")
+            .expect("late load")
+            .downtime_remaining_min = 12.0;
+        let ctx = cost_context(&rooms, &graph, &stats, &loads, 30.0);
+
+        let walk = ctx.walk_to("soon");
+        assert!((walk - 3.5).abs() < 1e-9);
+        let soon = cost_for(&ctx, "soon");
+        let late = cost_for(&ctx, "late");
+        // The short outage ends before the patient arrives: no wait.
+        assert!((soon - (walk + 10.0)).abs() < 1e-9);
+        // The long outage leaves 8.5 minutes after arrival.
+        assert!((late - (walk + 8.5 + 10.0)).abs() < 1e-9);
+        assert!(soon < late);
+        assert_eq!(ctx.wait_at("soon"), 0.0);
+        assert!((ctx.wait_at("late") - 8.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn downtime_risk_follows_observed_history_and_the_start_window() {
+        let rooms = vec![
+            room("risky", 10.0, 1),
+            room("spent", 10.0, 1),
+            room("other", 30.0, 1),
+        ];
+        let graph = graph(&rooms, &[]);
+        let stats = stats(&rooms, &[]);
+        let mut loads = loads(&[("risky", 0, 0, 0, 0), ("spent", 0, 0, 0, 0), ("other", 0, 0, 0, 0)]);
+        loads
+            .get_mut("spent")
+            .expect("spent load")
+            .downtime_episodes = 1;
+
+        // Inside the start window, a room with no observed outage still
+        // carries a future-outage probability; a spent room does not.
+        let early = cost_context(&rooms, &graph, &stats, &loads, 40.0);
+        let risky = early.downtime_risk("risky");
+        let spent = early.downtime_risk("spent");
+        assert!(risky > spent, "unobserved room should carry risk");
+        assert!(risky < 0.5, "risk should stay a light nudge");
+        // Service length must not reorder equally unobserved rooms; only the
+        // observed outage history and the clock can.
+        assert!((risky - early.downtime_risk("other")).abs() < 1e-12);
+
+        // After the last possible start neither room has future risk.
+        let late = cost_context(&rooms, &graph, &stats, &loads, 200.0);
+        assert_eq!(late.downtime_risk("risky"), 0.0);
+        assert_eq!(late.downtime_risk("spent"), 0.0);
+    }
+
+    #[test]
+    fn downtime_risk_only_settles_equal_walk_near_ties() {
+        // Both rooms are empty and cost the same, so the tie-break reaches the
+        // outage history: the spent room wins even though it is listed second.
+        {
+            let rooms = vec![
+                room_at("risky", 10.0, 1, (10.0, 0.0)),
+                room_at("spent", 10.0, 1, (10.0, 0.0)),
+            ];
+            let graph = graph(&rooms, &[]);
+            let stats = stats(&rooms, &[]);
+            let mut room_loads = loads(&[("risky", 0, 0, 0, 0), ("spent", 0, 0, 0, 0)]);
+            room_loads
+                .get_mut("spent")
+                .expect("spent load")
+                .downtime_episodes = 1;
+            let ctx = cost_context(&rooms, &graph, &stats, &room_loads, 40.0);
+            let required = vec!["risky".to_string(), "spent".to_string()];
+            assert_eq!(
+                ctx.next_room(Strategy::Optimized, &required, &[]),
+                Some("spent".to_string())
+            );
+        }
+
+        // Distance still outranks risk: the nearer room wins on a near-tie
+        // even if its outage has not happened yet.
+        {
+            let rooms = vec![
+                room_at("near_risky", 10.0, 1, (3.0, 0.0)),
+                room_at("far_spent", 10.0, 1, (20.0, 0.0)),
+            ];
+            let graph = graph(&rooms, &[]);
+            let stats = stats(&rooms, &[]);
+            let mut room_loads =
+                loads(&[("near_risky", 0, 0, 0, 0), ("far_spent", 0, 0, 0, 0)]);
+            room_loads
+                .get_mut("far_spent")
+                .expect("far load")
+                .downtime_episodes = 1;
+            let ctx = cost_context(&rooms, &graph, &stats, &room_loads, 40.0);
+            let required = vec!["far_spent".to_string(), "near_risky".to_string()];
+            assert_eq!(
+                ctx.next_room(Strategy::Optimized, &required, &[]),
+                Some("near_risky".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn downtime_fields_do_not_change_baseline_choices() {
+        let rooms = vec![room("down", 10.0, 1), room("up", 10.0, 1)];
+        let graph = graph(&rooms, &[]);
+        let stats = stats(&rooms, &[]);
+        let mut loads = loads(&[("down", 0, 0, 0, 0), ("up", 1, 0, 0, 0)]);
+        {
+            let down = loads.get_mut("down").expect("down load");
+            down.downtime_remaining_min = 15.0;
+            down.downtime_episodes = 1;
+        }
+        let ctx = cost_context(&rooms, &graph, &stats, &loads, 30.0);
+        let required = vec!["down".to_string(), "up".to_string()];
+
+        // Fixed Order follows the package and Shortest Queue only counts the
+        // queue, even though "down" is offline.
+        assert_eq!(
+            ctx.next_room(Strategy::FixedOrder, &required, &[]),
+            Some("down".to_string())
+        );
+        assert_eq!(
+            ctx.next_room(Strategy::ShortestQueue, &required, &[]),
+            Some("down".to_string())
         );
     }
 }
