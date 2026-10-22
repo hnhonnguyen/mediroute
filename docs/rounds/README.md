@@ -519,3 +519,117 @@ Baselines khớp **từng số** với Round 4 ở cả 3 seed × 4 metric (77.0
 **Decision:** DISCARD — p90_total regression +18.54 (seed 42) / +18.44 (seed 123). Chẩn đoán của agent xác nhận: urgent-only estimate gần hòa nhưng normal-only tái hiện phần lớn regression; bỏ normal queue khỏi ước lượng urgent khiến urgent herding vào phòng đông, chuyển chi phí sang normal (5 patients General Checkup seed 42 kết tour tại ENT với wait 20–30 min).
 
 **Bài học:** tách ước lượng wait theo class chỉ an toàn khi lượng urgent đủ nhỏ để effect bậc hai; ở đây ~10% urgent đủ để sai lệch ước lượng normal (jumpers) bẻ cong tour của 90% patients. Nếu thử lại: chỉ sửa est_wait_urgent (giữ normal = generic), bỏ term jumpers.
+
+---
+
+## Round 8 — Time-aware future congestion model (chỉ Optimized)
+
+**Status:** ✅ COMMITTED (verified độc lập 5 seeds — mean tốt hơn Round 4 cả avg_total lẫn p90_total)
+
+**Aspect đề xuất:**
+- Chẩn đoán từ Round 6: future-wait dạng decay tuyến tính `max(0, est_wait − arrive_in)` mù với contention tương lai. Trong rush, wait không giảm mà có thể tăng vì arrivals mới vượt capacity drain; trong lull/end-of-day thì giảm nhanh.
+- Thay decay bằng mô hình demand tĩnh: `future_wait(room, h)` dựng lại station backlog hiện tại, rồi đổ thêm expected arrivals từ arrival schedule của scenario trong khoảng `(now, now + h]`, trừ dần bằng capacity (kể cả downtime), và trả wait của một patient đến sau `h` phút.
+- Chỉ dùng cho lookahead bước 2 của Optimized (giữ nguyên cấu trúc 1 bước của Round 4, không rollout toàn tour). `wait_at` hiện tại, baselines, priority queue, API/JSON và frontend không đổi.
+
+**Thiết kế:**
+
+*Demand model (`scenario.rs`, offline, không dynamic learning):*
+- `ArrivalDemand::from_scenario(scenario, N)` với `N = patient_count`:
+  - `λ_hosp(t) = 0.65·N / 120` cho `t ∈ [0, 120)`; `0` cho `[120, 150)`; `0.35·N / 60` cho `[150, 210)`; `0` sau `210` (đúng rush profile: 65% trong 0–120, 35% trong 150–210, lull 120–150).
+  - Độ phổ biến phòng: `share(r) = Σ_{package p chứa r} weight(p) / Σ_p weight(p)`.
+  - `λ_r(t) = share(r) · λ_hosp(t)`; expected arrivals trên `[a, b]` là tích phân từng khung: `E_r(a,b) = Σ_segments overlap(a,b,segment) · rate_segment · share(r)`. Tổng arrivals toàn viện qua 2 cửa sổ = `N` (test bảo toàn).
+- Ví dụ demo: `share(blood_test) = 0.80`, `share(ent) = 0.45`, `share(ultrasound) = 0.30`.
+
+*Future wait (`congestion.rs`):*
+- Với phòng capacity `C`, service estimate `s`, downtime `d`:
+  - Khởi tạo `C` station free-times: `q_i = max(in_service_remaining_i, d)`; station chưa dùng = `d`.
+  - Đổ các job đã committed (`pending_starts + queue_len + en_route`) với ready = 0 theo list scheduling: luôn chọn station sớm nhất, `q = max(q, ready) + s`.
+  - Expected arrivals trong `(now, now+h]` chia slice 1 phút: slice tại offset `k` có `e_k` arrivals → đổ `e_k` job (fractional) với `ready = k`, work `= e_k · s`. Anti-herding `likely_arrivals` (competitor sẽ rảnh tại `ready_in`) cũng được đổ tại đúng `ready_in ≤ h`, weight tương ứng — không double-count vì họ chưa nằm trong queue hiện tại.
+  - `future_wait(room, h) = max(0, min_i q_i − h)`.
+- Khi `λ = 0` (lull 120–150, sau 210, hoặc test không demand) model thoái hóa đúng về `max(0, wait_hiện_tại − h)` — tương thích hành vi Round 4.
+- Trong rush, nếu `λ_r · s > C` thì backlog tương lai tăng tuyến tính; ví dụ Orthopedics: `share = 0.30`, `λ_peak = 0.65·52/120 ≈ 0.282/min` → `λ_r ≈ 0.085/min`, `× 16 min service = 1.35 > C = 1` nên phòng đang trống vẫn tích queue khi horizon dài ra.
+- `future_wait` chỉ thay thế `future_wait` của lookahead; `wait_at` (chi phí phòng kế tiếp) giữ nguyên `congestion::est_wait_min`.
+
+*Router (`router.rs`):*
+- `RouteContext` thêm `demand: Option<&ArrivalDemand>` và `now_min: f64` (additive, test cũ dùng `None`/`0.0`).
+- `lookahead(r) = min_{r' eligible sau r} [walk(r,r') + future_wait(r', arrive_in) + est_service(r')]`, `arrive_in = walk(current,r) + wait_at(r) + est_service(r) + walk(r,r')` — đúng thời điểm patient thực sự tới `r'`.
+- `LOOKAHEAD_WEIGHT` giữ `0.5`; tie-band 25% và tie-break giữ nguyên.
+
+**Chọn hệ số lookahead** (mỗi mức fresh data dir + live seed 99 + compare 42/7/123, learned stats riêng của chính nó; bảng là Optimized avg_total / p90_total):
+
+| w | seed 42 | seed 7 | seed 123 |
+|---|---|---|---|
+| 0.40 | 64.83 / 82.62 | 72.80 / 126.47 | 76.78 / 130.16 |
+| 0.45 | 66.19 / 87.86 | 73.13 / 128.20 | 76.91 / 129.34 |
+| **0.50** | **64.07 / 77.79** | **73.13 / 128.20** | **72.29 / 116.37** |
+| 0.55 | 65.26 / 80.53 | 73.70 / 128.20 | 80.72 / 122.27 |
+| 0.60 | 64.38 / 83.14 | 73.31 / 126.89 | 80.13 / 134.62 |
+| 0.50 bỏ likely arrivals | 62.86 / 75.66 | 72.70 / 128.30 | 78.56 / 142.34 |
+| 0.50 max(decay cũ, model) | 64.07 / 77.79 | 73.13 / 128.20 | 72.29 / 116.37 |
+
+- **Chọn w = 0.5**: tốt nhất ở seed 42/123 cả avg_total lẫn p90_total; seed 7 chỉ kém mức tốt nhất ~0.5% avg / ~1.4% p90. w = 0.55/0.60 kéo seed 123 tệ đi rõ (avg 80.7/80.1); w = 0.40/0.45 tốt seed 7 nhưng p90 seed 42/123 kém.
+- Bỏ likely arrivals (chỉ demand λ) cải thiện seed 42/7 nhưng p90 seed 123 vọt lên 142.34 (+16.9% vs Round 4) → giữ likely arrivals tại đúng ready time.
+- Bọc `max(decay cũ, model)` cho kết quả **bit-identical** với model thuần trên cả 3 seed: trong scenario này model đã ≥ decay tại các horizon dùng; regression seed 42 không phải do định giá quá cao so với decay mà do áp lực rush đổi thứ hạng bước 2. Giữ model thuần cho đơn giản.
+
+**Kết quả compare (verify chuẩn, headless):**
+
+Seed 42:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized** | **64.07** | **2.91** | **77.79** | **11.51** |
+| FixedOrder | 77.02 | 5.91 | 130.21 | 13.45 |
+| ShortestQueue | 71.32 | 4.33 | 103.89 | 13.57 |
+
+Seed 7:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized** | **73.13** | **4.68** | **128.20** | **11.76** |
+| FixedOrder | 84.39 | 7.08 | 138.89 | 13.82 |
+| ShortestQueue | 77.82 | 5.56 | 139.75 | 13.10 |
+
+Seed 123:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized** | **72.29** | **6.60** | **116.37** | **10.81** |
+| FixedOrder | 86.44 | 10.17 | 145.23 | 12.73 |
+| ShortestQueue | 81.09 | 8.67 | 126.75 | 12.49 |
+
+Baselines khớp **từng số** với Round 4 ở cả 3 seed × 4 metric (77.0249/5.9134/130.2068/13.4523; 71.3185/4.3273/103.8948/13.5720; 84.3898/7.0846/138.8932/13.8233; 77.8194/5.5577/139.7541/13.0962; 86.4409/10.1679/145.2265/12.7288; 81.0868/8.6726/126.7505/12.4931) → physics, seed và routing của baselines không bị đụng.
+
+**Đánh giá vs Round 4 (Optimized):**
+
+| Seed | Δ avg_total | Δ avg_wait | Δ p90_total | Δ avg_walk |
+|---|---|---|---|---|
+| 42 | +0.15 (+0.23%) | +0.18 (+6.78%) | +1.90 (+2.50%) | −0.54 (−4.47%) |
+| 7 | +0.33 (+0.46%) | +0.25 (+5.67%) | +1.31 (+1.03%) | −0.63 (−5.05%) |
+| 123 | −3.63 (−4.78%) | −0.97 (−12.85%) | −5.44 (−4.47%) | −0.29 (−2.65%) |
+| **Mean 3 seed** | **−1.05 (−1.48%)** | **−0.18 (−3.65%)** | **−0.75 (−0.69%)** | **−0.49 (−4.11%)** |
+
+- Theo mean 3 seed, cả 4 metric đều tốt hơn Round 4; lợi ích tập trung ở seed 123 (avg_total −4.78%, p90_total −4.47%, avg_wait −12.85%), nơi rush contention mạnh nhất.
+- Theo từng seed: seed 123 đạt rõ tiêu chí; seed 7 p90 +1.03% nằm trong ngưỡng 1–2% và avg +0.46% coi như hòa; seed 42 p90 +2.50% **hơi vượt ngưỡng 2%** và avg +0.23% (trong noise). Vì vậy không tuyên bố win tuyệt đối — đây là win tổng hợp có điều kiện.
+- Optimized vẫn thắng cả 2 baselines trên cả 4 metric ở cả 3 seed.
+- avg_wait tăng 5.7–6.8% ở seed 42/7 nhưng avg_total gần như không đổi và walk giảm 4.5–5.1%: routing đổi sang tour ngắn hơn, ít tail hơn; tail chỉ xấu nhẹ ở seed 42.
+- Không có dấu hiệu over-bias: avg_walk giảm cả 3 seed.
+
+Live seed 99 (fresh dir, speed 5000→clamp 60): finished t = 399.75 phút, 52/52, 188 visits; **78.01 / 6.61 / 146.60 / 16.47 / 11.05** (avg_total/avg_wait/p90_total/p90_wait/avg_walk). Round 4: 80.99 / 7.29 / 149.97 / 19.91 / 11.53 → live cũng tốt hơn ở cả 5 metric (avg_total −2.98, p90_total −3.37, p90_wait −3.44, walk −0.48).
+
+**Files changed:** `backend/src/scenario.rs` (`ArrivalSegment`/`ArrivalDemand` + 2 test), `backend/src/engine/congestion.rs` (`future_wait_min` + `push_job` + 6 test), `backend/src/engine/router.rs` (`RouteContext.demand/now_min`, `future_wait` dùng model, 2 test mới; 17 test literal thêm field, không đổi hành vi), `backend/src/engine/sim.rs` (World dựng `ArrivalDemand` và truyền vào RouteContext), `docs/rounds/README.md`. Không đổi `wait_at`/predictive wait hiện tại, FixedOrder/ShortestQueue, priority queue, `domain.rs`, `stats.rs`, `learn.rs`, API/JSON, frontend.
+
+**Verify steps:**
+1. `cargo test`: **64/64 pass** (54 test cũ + 10 mới: 2 scenario — bảo toàn N + lull, room share theo package; 6 congestion — no-demand khớp decay cũ, tăng trong rush, về 0 lúc lull/sau 210, phản ánh room share, likely arrivals đúng ready time, downtime; 2 router — lookahead dùng đúng `arrive_in` + future_wait tăng theo horizon, baselines không đổi lựa chọn).
+2. `npm run build`: OK (chỉ warning chunk > 500 kB có từ trước).
+3. Fresh `MEDIROUTE_DATA_DIR=/tmp/mediroute-r8-test`, server riêng `PORT=8082`; live `{strategy:optimized, speed:5000, seed:99}` → finished 399.75 phút, 52/52, 188 visits.
+4. `POST /api/sim/compare` seed 42 → 7 → 123; ghi đủ 4 metric cho 3 strategies; xác nhận baselines khớp Round 4 từng số.
+5. Sweep w lặp quy trình với fresh dir riêng `/tmp/mediroute-r8-w0*`; biến thể bỏ likely arrivals và `max(decay, model)`.
+6. Port 8080 không đụng; không git commit/push.
+
+**Decision:** WIN TỔNG HỢP CÓ ĐIỀU KIỆN — không commit (theo yêu cầu round). Mean 3 seed cải thiện cả avg_total, avg_wait, p90_total và avg_walk; baselines tuyệt đối không đổi; API/JSON không đổi. Điểm trượt nhẹ nếu áp tiêu chí per-seed nghiêm ngặt: seed 42 p90_total +2.50% (>2%), trong khi seed 7 p90 +1.03% và seed 123 cải thiện mạnh. Code giữ ở working tree (uncommitted) để coordinator verify độc lập.
+
+**Bài học:** xác nhận chẩn đoán Round 6 — decay tuyến tính bỏ qua áp lực arrivals là sai hệ thống trong rush; mô hình λ + station drain cho future-wait tăng/giảm đúng pha và mang lại lợi ích tail lớn ở seed contention cao (seed 123) mà không đổi predictive wait hiện tại. Lợi ích không đồng đều giữa các seed và khá nhạy với cách xử lý competitor (likely arrivals): bỏ chúng tốt cho seed 42 nhưng phá tail seed 123. Hướng tiếp theo nếu cần ổn định per-seed: threshold hóa model theo mức vượt capacity (`λ_r · s` so với `C`) thay vì luôn cộng expected arrivals, hoặc blend có trọng số với decay cũ — nhưng `max(decay, model)` đã thử và bit-identical, nên cần cơ chế khác chứ không chỉ clamp.
+
+**Verify độc lập (coordinator) — mở rộng 5 seeds:** cargo test 64/64; lặp quy trình chuẩn trên cả R8 (working tree) và R4 (worktree HEAD): fresh dir → live seed 99 → compare seeds 42/7/123/5/2024. Kết quả: R8 thua nhỏ ở seeds nhàn (42: +0.15 avg/+1.90 p90; 7: +0.33/+1.31; 2024: +0.83 avg nhưng p90 −1.76) nhưng thắng lớn ở seeds congested (123: −3.63/−5.44; **5: −0.72/−37.00**). Mean 5 seeds: avg_total 79.95→79.34 (−0.61), p90_total 143.39→135.19 (−8.20). Loại seed 5, mean 4 seeds vẫn tốt hơn cả hai metric.
+
+**Decision:** COMMIT — mean tốt hơn trên cả avg_total lẫn p90_total qua 5 seeds; cải thiện lớn nhất đúng vùng mục tiêu (high contention), regression chỉ ở seeds nhạn dưới 2.5% p90. Mô hình future congestion khắc phục đúng điểm mù được chẩn đoán ở Round 6 (wait decay về 0).

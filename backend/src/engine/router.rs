@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{walk_time, DependencyGraph, Room, RoomStats, ENTRANCE_ID, ENTRANCE_POSITION, WALK_TIME_MIN};
+use crate::scenario::ArrivalDemand;
 
 use super::congestion;
 
@@ -76,6 +77,11 @@ pub struct RouteContext<'a> {
     pub loads: &'a HashMap<String, RoomLoad>,
     /// Physical location the patient is leaving: `ENTRANCE_ID` or a room id.
     pub current_location: &'a str,
+    /// Scenario arrival pattern and room popularity, used to price future
+    /// congestion. `None` in isolated tests with no background demand.
+    pub demand: Option<&'a ArrivalDemand>,
+    /// Current simulation clock, needed to align arrival windows.
+    pub now_min: f64,
 }
 
 impl RouteContext<'_> {
@@ -181,11 +187,20 @@ impl RouteContext<'_> {
         congestion::est_wait_min(&self.load(room), self.est_service(room), self.capacity(room))
     }
 
-    /// Projected wait when arriving at `room` in `arrive_in_min` minutes: the
-    /// station-free time is fixed in the near term, so the wait shrinks with
-    /// the time spent on the current step (never below zero).
+    /// Projected wait when arriving at `room` in `arrive_in_min` minutes. The
+    /// current station backlog drains at capacity, while expected arrivals
+    /// from the scenario demand model add load over the same horizon. During a
+    /// rush this can grow instead of decaying; in the lull it falls to zero.
     fn future_wait(&self, room: &str, arrive_in_min: f64) -> f64 {
-        (self.wait_at(room) - arrive_in_min.max(0.0)).max(0.0)
+        congestion::future_wait_min(
+            &self.load(room),
+            self.est_service(room),
+            self.capacity(room),
+            self.demand,
+            room,
+            self.now_min,
+            arrive_in_min.max(0.0),
+        )
     }
 
     /// Cheapest projected second step after finishing `room`, or 0 when no
@@ -337,6 +352,7 @@ fn costs_within_percent(a: f64, b: f64, percent: f64) -> bool {
 mod tests {
     use super::*;
     use crate::domain::{DependencyEdge, Room};
+    use crate::scenario::demo_scenario;
 
     fn room(id: &str, seed: f64, capacity: usize) -> Room {
         room_at(id, seed, capacity, (0.0, 0.0))
@@ -421,6 +437,8 @@ mod tests {
             stats: &stats,
             loads: &loads,
             current_location: ENTRANCE_ID,
+            demand: None,
+            now_min: 0.0,
         };
         let required = vec!["blood".into(), "endo".into()];
 
@@ -446,6 +464,8 @@ mod tests {
             stats: &stats,
             loads: &loads,
             current_location: ENTRANCE_ID,
+            demand: None,
+            now_min: 0.0,
         };
         let required = vec!["a".into(), "b".into()];
         assert_eq!(
@@ -468,6 +488,8 @@ mod tests {
             stats: &stats,
             loads: &loads,
             current_location: ENTRANCE_ID,
+            demand: None,
+            now_min: 0.0,
         };
         let required = vec!["a".into(), "b".into()];
         assert_eq!(
@@ -489,6 +511,8 @@ mod tests {
             stats: &stats,
             loads: &loads,
             current_location: ENTRANCE_ID,
+            demand: None,
+            now_min: 0.0,
         };
         let required = vec!["a".into(), "b".into()];
         assert_eq!(
@@ -509,6 +533,8 @@ mod tests {
             stats: &stats,
             loads: &loads,
             current_location: ENTRANCE_ID,
+            demand: None,
+            now_min: 0.0,
         };
         let required = vec!["a".into(), "b".into()];
         assert_eq!(
@@ -533,6 +559,8 @@ mod tests {
             stats: &stats,
             loads: &loads,
             current_location: ENTRANCE_ID,
+            demand: None,
+            now_min: 0.0,
         };
         let required = vec!["a".into(), "b".into(), "c".into()];
         assert_eq!(
@@ -553,6 +581,8 @@ mod tests {
             stats: &stats,
             loads: &loads,
             current_location: ENTRANCE_ID,
+            demand: None,
+            now_min: 0.0,
         };
 
         // Endocrinology alone is fine: the blood-test edge is not relevant.
@@ -589,6 +619,8 @@ mod tests {
             stats: &stats,
             loads: &loads,
             current_location: ENTRANCE_ID,
+            demand: None,
+            now_min: 0.0,
         };
         let required = vec!["a".into(), "b".into()];
         assert_eq!(
@@ -617,6 +649,8 @@ mod tests {
             stats: &stats,
             loads: &loads,
             current_location: ENTRANCE_ID,
+            demand: None,
+            now_min: 0.0,
         };
         let required = vec![
             "b".to_string(),
@@ -648,6 +682,8 @@ mod tests {
             stats: &stats,
             loads: &loads,
             current_location: ENTRANCE_ID,
+            demand: None,
+            now_min: 0.0,
         };
         // a is listed first and has the deeper chain, but b is clearly cheaper.
         let required = vec!["a".into(), "b".into(), "c".into(), "d".into()];
@@ -672,6 +708,8 @@ mod tests {
             stats: &stats,
             loads: &loads,
             current_location: ENTRANCE_ID,
+            demand: None,
+            now_min: 0.0,
         };
         // Same wait and service; the far room is listed first.
         let required = vec!["far".into(), "near".into()];
@@ -700,6 +738,8 @@ mod tests {
             stats: &stats,
             loads: &loads,
             current_location: "west",
+            demand: None,
+            now_min: 0.0,
         };
         let required = vec!["near_entrance".into(), "next_here".into()];
         assert_eq!(
@@ -725,6 +765,8 @@ mod tests {
             stats: &stats,
             loads: &loads,
             current_location: ENTRANCE_ID,
+            demand: None,
+            now_min: 0.0,
         };
         let required = vec!["far".into(), "near".into()];
         assert_eq!(
@@ -749,6 +791,8 @@ mod tests {
             stats: &stats,
             loads: &loads,
             current_location: "a",
+            demand: None,
+            now_min: 0.0,
         };
         let required = vec!["a".to_string(), "b".to_string()];
         let required_set: HashSet<&str> = required.iter().map(String::as_str).collect();
@@ -774,6 +818,8 @@ mod tests {
             stats: &stats,
             loads: &loads,
             current_location: ENTRANCE_ID,
+            demand: None,
+            now_min: 0.0,
         };
 
         // Two queued patients at 10 minutes each project a 20-minute wait.
@@ -781,6 +827,90 @@ mod tests {
         assert!((ctx.future_wait("next", 5.0) - 15.0).abs() < 1e-9);
         assert_eq!(ctx.future_wait("next", 20.0), 0.0);
         assert_eq!(ctx.future_wait("next", 50.0), 0.0);
+    }
+
+    #[test]
+    fn lookahead_prices_the_follow_up_at_its_projected_arrival_time() {
+        // During the primary rush an overloaded room's projected wait grows
+        // with the horizon, so the lookahead must use the exact arrival time,
+        // not a linear decay from the current estimate.
+        let demand = ArrivalDemand::from_scenario(&demo_scenario(), 52);
+        let rooms = vec![
+            room_at("first", 5.0, 1, (0.0, 0.0)),
+            room_at("orthopedics", 16.0, 1, (5.0, 0.0)),
+        ];
+        let graph = graph(&rooms, &[]);
+        let stats = stats(&rooms, &[]);
+        let loads = HashMap::new();
+        let ctx = RouteContext {
+            rooms: &rooms,
+            graph: &graph,
+            stats: &stats,
+            loads: &loads,
+            current_location: ENTRANCE_ID,
+            demand: Some(&demand),
+            now_min: 20.0,
+        };
+        let required = vec!["first".to_string(), "orthopedics".to_string()];
+        let required_set: HashSet<&str> = required.iter().map(String::as_str).collect();
+        let done_set: HashSet<&str> = HashSet::new();
+
+        let arrive_in = ctx.walk_to("first")
+            + ctx.wait_at("first")
+            + ctx.est_service("first")
+            + ctx.walk_between("first", "orthopedics");
+        let expected = ctx.walk_between("first", "orthopedics")
+            + ctx.future_wait("orthopedics", arrive_in)
+            + ctx.est_service("orthopedics");
+        assert!((ctx.lookahead_cost("first", &required_set, &done_set) - expected).abs() < 1e-9);
+        assert!(ctx.future_wait("orthopedics", arrive_in) > 0.0);
+        assert!(
+            ctx.future_wait("orthopedics", arrive_in + 20.0)
+                > ctx.future_wait("orthopedics", arrive_in)
+        );
+    }
+
+    #[test]
+    fn demand_model_does_not_change_baseline_choices() {
+        let demand = ArrivalDemand::from_scenario(&demo_scenario(), 52);
+        let rooms = vec![room("a", 10.0, 1), room("b", 10.0, 1)];
+        let graph = graph(&rooms, &[]);
+        let stats = stats(&rooms, &[]);
+        let loads = loads(&[("a", 0, 0, 0, 0), ("b", 2, 0, 0, 0)]);
+        let with_demand = RouteContext {
+            rooms: &rooms,
+            graph: &graph,
+            stats: &stats,
+            loads: &loads,
+            current_location: ENTRANCE_ID,
+            demand: Some(&demand),
+            now_min: 30.0,
+        };
+        let without_demand = RouteContext {
+            rooms: &rooms,
+            graph: &graph,
+            stats: &stats,
+            loads: &loads,
+            current_location: ENTRANCE_ID,
+            demand: None,
+            now_min: 30.0,
+        };
+        let required = vec!["a".to_string(), "b".to_string()];
+        for strategy in [Strategy::FixedOrder, Strategy::ShortestQueue] {
+            assert_eq!(
+                with_demand.next_room(strategy, &required, &[]),
+                without_demand.next_room(strategy, &required, &[])
+            );
+        }
+        // Fixed Order follows the package, Shortest Queue follows the queue.
+        assert_eq!(
+            with_demand.next_room(Strategy::FixedOrder, &required, &[]),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            with_demand.next_room(Strategy::ShortestQueue, &required, &[]),
+            Some("a".to_string())
+        );
     }
 
     /// X is cheaper right now, but choosing it leaves only the expensive A for
@@ -807,6 +937,8 @@ mod tests {
             stats: &stats,
             loads: &loads,
             current_location: ENTRANCE_ID,
+            demand: None,
+            now_min: 0.0,
         };
         let required = vec!["x".to_string(), "b".to_string(), "a".to_string()];
         let required_set: HashSet<&str> = required.iter().map(String::as_str).collect();
@@ -862,6 +994,8 @@ mod tests {
             stats: &stats,
             loads: &loads,
             current_location: ENTRANCE_ID,
+            demand: None,
+            now_min: 0.0,
         };
         let required = vec!["x".to_string(), "b".to_string(), "a".to_string()];
 

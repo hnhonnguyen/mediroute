@@ -11,7 +11,7 @@ use crate::domain::{
     Scenario, VisitRecord, ENTRANCE_ID, ENTRANCE_POSITION, WALK_TIME_MIN,
 };
 use crate::scenario::{
-    DEFAULT_ARRIVAL_WINDOW_MIN, DOWNTIME_MAX_MIN, DOWNTIME_MIN_MIN,
+    ArrivalDemand, DEFAULT_ARRIVAL_WINDOW_MIN, DOWNTIME_MAX_MIN, DOWNTIME_MIN_MIN,
     DOWNTIME_PROBABILITY, PRIMARY_PEAK_END_MIN, PRIMARY_PEAK_SHARE, PRIMARY_PEAK_START_MIN,
     SECONDARY_PEAK_END_MIN, SECONDARY_PEAK_START_MIN, URGENT_PATIENT_SHARE,
 };
@@ -189,6 +189,7 @@ pub struct World {
     patients: Vec<Patient>,
     events: BinaryHeap<ScheduledEvent>,
     learner: Learner,
+    demand: ArrivalDemand,
     seq: u64,
     departed: usize,
     finished_at: Option<f64>,
@@ -271,6 +272,7 @@ impl World {
                 .then_with(|| a.id.cmp(&b.id))
         });
 
+        let demand = ArrivalDemand::from_scenario(scenario, patient_count);
         let mut world = Self {
             scenario_rooms: scenario.rooms.clone(),
             room_index,
@@ -282,6 +284,7 @@ impl World {
             patients,
             events: BinaryHeap::new(),
             learner,
+            demand,
             seq: 0,
             departed: 0,
             finished_at: None,
@@ -718,6 +721,8 @@ impl World {
             stats: self.learner.stats(),
             loads: &loads,
             current_location: &patient.current_location,
+            demand: Some(&self.demand),
+            now_min: self.now,
         };
         context.next_room(self.strategy, &patient.required_rooms, &patient.done_rooms)
     }

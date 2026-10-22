@@ -1,4 +1,5 @@
 use super::router::RoomLoad;
+use crate::scenario::ArrivalDemand;
 
 /// Everyone who will be served before a newly arriving patient.
 #[allow(dead_code)] // shared head-count helper, exercised by the router tests
@@ -32,6 +33,82 @@ pub fn est_wait_min(load: &RoomLoad, est_service_min: f64, capacity: usize) -> f
     } else {
         projected_wait(load, est_service_min, capacity, extra_jobs)
     }
+}
+
+/// Projected wait for a patient who arrives `horizon_min` from now. The
+/// current cohort keeps the station model of `est_wait_min`, while expected
+/// arrivals from the scenario demand model consume a station at their arrival
+/// minute. During a rush, arrivals can outpace the drain rate and the wait
+/// grows; during the lull or after the last burst no arrivals are added and
+/// the remaining load drains at capacity until it reaches zero.
+pub fn future_wait_min(
+    load: &RoomLoad,
+    est_service_min: f64,
+    capacity: usize,
+    demand: Option<&ArrivalDemand>,
+    room: &str,
+    now_min: f64,
+    horizon_min: f64,
+) -> f64 {
+    let horizon = horizon_min.max(0.0);
+    let service = est_service_min.max(0.0);
+    let capacity = capacity.max(1);
+    let downtime = load.downtime_remaining_min.max(0.0);
+
+    let mut stations: Vec<f64> = load
+        .in_service_remaining
+        .iter()
+        .take(capacity)
+        .map(|remaining| remaining.max(0.0).max(downtime))
+        .collect();
+    while stations.len() < capacity {
+        stations.push(downtime);
+    }
+
+    let committed = load.pending_starts + load.queue_len + load.en_route;
+    for _ in 0..committed {
+        push_job(&mut stations, service, 0.0);
+    }
+
+    // Future demand in chronological order: scenario arrivals integrated in
+    // one-minute slices plus anti-herding competitors that will become free at
+    // a known time. Likely arrivals are not part of the current queue, so
+    // adding them here is not double counting.
+    let mut future_arrivals: Vec<(f64, f64)> = Vec::new();
+    if let Some(demand) = demand {
+        let until = now_min + horizon;
+        let mut at = now_min;
+        while at < until {
+            let next = (at + 1.0).min(until);
+            let expected = demand.expected_arrivals(room, at, next);
+            if expected > 0.0 {
+                future_arrivals.push((at - now_min, expected));
+            }
+            at = next;
+        }
+    }
+    for arrival in &load.likely_arrivals {
+        let weight = arrival.weight.max(0.0);
+        if weight > 0.0 && arrival.ready_in_min <= horizon {
+            future_arrivals.push((arrival.ready_in_min.max(0.0), weight));
+        }
+    }
+    future_arrivals.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (ready_offset, count) in future_arrivals {
+        push_job(&mut stations, service * count, ready_offset);
+    }
+
+    let earliest = stations.iter().copied().fold(f64::INFINITY, f64::min);
+    (earliest - horizon).max(0.0)
+}
+
+fn push_job(stations: &mut [f64], work_min: f64, ready_offset_min: f64) {
+    let (idx, _) = stations
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .expect("capacity is at least one");
+    stations[idx] = stations[idx].max(ready_offset_min) + work_min;
 }
 
 pub fn route_cost(
@@ -87,7 +164,9 @@ fn projected_wait(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{Package, Room, Scenario, WALK_TIME_MIN};
     use crate::engine::router::ExpectedArrival;
+    use crate::scenario::demo_scenario;
 
     fn load(
         queue_len: usize,
@@ -198,5 +277,112 @@ mod tests {
     fn empty_room_cost_is_service_plus_walk() {
         let cost = route_cost(&RoomLoad::default(), 12.0, 3, 2.0);
         assert!((cost - 14.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn future_wait_without_demand_matches_decaying_current_wait() {
+        let queued = load(2, &[], 0, 0);
+        assert!((future_wait_min(&queued, 10.0, 1, None, "a", 0.0, 0.0) - 20.0).abs() < 1e-9);
+        assert!((future_wait_min(&queued, 10.0, 1, None, "a", 0.0, 5.0) - 15.0).abs() < 1e-9);
+        assert_eq!(future_wait_min(&queued, 10.0, 1, None, "a", 0.0, 20.0), 0.0);
+        assert_eq!(future_wait_min(&queued, 10.0, 1, None, "a", 0.0, 50.0), 0.0);
+    }
+
+    #[test]
+    fn future_wait_grows_during_rush_when_arrivals_outpace_capacity() {
+        let demand = ArrivalDemand::from_scenario(&demo_scenario(), 52);
+        let empty = RoomLoad::default();
+        // Orthopedics: 30% of peak arrivals x 16-minute service exceeds one
+        // station, so an idle room still builds a queue as the rush goes on.
+        let early = future_wait_min(&empty, 16.0, 1, Some(&demand), "orthopedics", 10.0, 10.0);
+        let later = future_wait_min(&empty, 16.0, 1, Some(&demand), "orthopedics", 10.0, 30.0);
+        assert!(early > 0.0, "rush should already create pressure at 10 min");
+        assert!(later > early, "future wait should grow: {later} vs {early}");
+    }
+
+    #[test]
+    fn future_wait_fades_to_zero_in_the_lull_and_after_the_last_burst() {
+        let demand = ArrivalDemand::from_scenario(&demo_scenario(), 52);
+        let queued = load(2, &[], 0, 0);
+        let in_lull = future_wait_min(&queued, 10.0, 1, Some(&demand), "ent", 120.0, 0.0);
+        assert!((in_lull - 20.0).abs() < 1e-9);
+        assert_eq!(
+            future_wait_min(&queued, 10.0, 1, Some(&demand), "ent", 120.0, 25.0),
+            0.0
+        );
+        assert_eq!(
+            future_wait_min(&queued, 10.0, 1, Some(&demand), "ent", 210.0, 25.0),
+            0.0
+        );
+    }
+
+    #[test]
+    fn future_wait_reflects_room_demand_share() {
+        // Same service and capacity, but Blood Test is in 90% of packages and
+        // ENT in 10%: the popular room accumulates future wait, the quiet one
+        // never saturates.
+        let scenario = Scenario {
+            rooms: vec![
+                Room {
+                    id: "blood_test".into(),
+                    name: "Blood Test".into(),
+                    initial_avg_service_min: 9.0,
+                    capacity: 1,
+                    wing: "test".into(),
+                    position: (0.0, 0.0),
+                },
+                Room {
+                    id: "ent".into(),
+                    name: "ENT".into(),
+                    initial_avg_service_min: 9.0,
+                    capacity: 1,
+                    wing: "test".into(),
+                    position: (1.0, 0.0),
+                },
+            ],
+            dependencies: Vec::new(),
+            packages: vec![
+                Package {
+                    id: "hot".into(),
+                    name: "Hot".into(),
+                    rooms: vec!["blood_test".into()],
+                    weight: 0.9,
+                },
+                Package {
+                    id: "cold".into(),
+                    name: "Cold".into(),
+                    rooms: vec!["ent".into()],
+                    weight: 0.1,
+                },
+            ],
+            walk_time_min: WALK_TIME_MIN,
+        };
+        let demand = ArrivalDemand::from_scenario(&scenario, 52);
+        let empty = RoomLoad::default();
+        let blood = future_wait_min(&empty, 9.0, 1, Some(&demand), "blood_test", 0.0, 40.0);
+        let ent = future_wait_min(&empty, 9.0, 1, Some(&demand), "ent", 0.0, 40.0);
+        assert!(blood > 0.0, "popular room should build a wait");
+        assert!(blood > ent, "blood {blood} should exceed ent {ent}");
+    }
+
+    #[test]
+    fn future_wait_places_likely_arrivals_at_their_ready_time() {
+        let mut room = RoomLoad::default();
+        room.likely_arrivals = vec![ExpectedArrival {
+            ready_in_min: 10.0,
+            weight: 1.0,
+        }];
+        assert_eq!(future_wait_min(&room, 10.0, 1, None, "a", 0.0, 5.0), 0.0);
+        assert!((future_wait_min(&room, 10.0, 1, None, "a", 0.0, 10.0) - 10.0).abs() < 1e-9);
+        assert!((future_wait_min(&room, 10.0, 1, None, "a", 0.0, 15.0) - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn future_wait_respects_downtime_window() {
+        let mut room = RoomLoad::default();
+        room.downtime_remaining_min = 15.0;
+        assert!((future_wait_min(&room, 10.0, 1, None, "a", 0.0, 0.0) - 15.0).abs() < 1e-9);
+        assert!((future_wait_min(&room, 10.0, 1, None, "a", 0.0, 10.0) - 5.0).abs() < 1e-9);
+        assert_eq!(future_wait_min(&room, 10.0, 1, None, "a", 0.0, 15.0), 0.0);
     }
 }

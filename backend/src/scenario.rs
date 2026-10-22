@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::domain::{DependencyEdge, Package, Room, Scenario, WALK_TIME_MIN};
 
 pub const DEFAULT_PATIENT_COUNT: usize = 52;
@@ -22,6 +24,98 @@ pub const URGENT_PATIENT_SHARE: f64 = 0.10;
 pub const LAB_WING: &str = "Lab wing";
 pub const IMAGING_WING: &str = "Imaging wing";
 pub const CONSULTATION_WING: &str = "Consultation wing";
+
+/// A contiguous window with a constant stream of newly arriving patients.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArrivalSegment {
+    pub start_min: f64,
+    pub end_min: f64,
+    /// New patients per minute into the hospital (before room popularity).
+    pub rate_per_min: f64,
+}
+
+/// Offline demand model for the run: when patients arrive (rush profile) and
+/// which fraction of them will need each room (package composition). Both are
+/// static, so routing can integrate expected arrivals over any time horizon.
+#[derive(Debug, Clone)]
+pub struct ArrivalDemand {
+    segments: Vec<ArrivalSegment>,
+    room_shares: HashMap<String, f64>,
+}
+
+impl ArrivalDemand {
+    pub fn from_scenario(scenario: &Scenario, patient_count: usize) -> Self {
+        let total_weight: f64 = scenario
+            .packages
+            .iter()
+            .map(|package| package.weight.max(0.0))
+            .sum();
+        let mut room_shares: HashMap<String, f64> = HashMap::new();
+        if total_weight > 0.0 {
+            for package in &scenario.packages {
+                let share = package.weight.max(0.0) / total_weight;
+                for room_id in &package.rooms {
+                    *room_shares.entry(room_id.clone()).or_default() += share;
+                }
+            }
+        }
+
+        let count = patient_count.max(1) as f64;
+        let primary_span = (PRIMARY_PEAK_END_MIN - PRIMARY_PEAK_START_MIN).max(1e-9);
+        let secondary_span = (SECONDARY_PEAK_END_MIN - SECONDARY_PEAK_START_MIN).max(1e-9);
+        let segments = vec![
+            ArrivalSegment {
+                start_min: PRIMARY_PEAK_START_MIN,
+                end_min: PRIMARY_PEAK_END_MIN,
+                rate_per_min: PRIMARY_PEAK_SHARE * count / primary_span,
+            },
+            ArrivalSegment {
+                start_min: SECONDARY_PEAK_START_MIN,
+                end_min: SECONDARY_PEAK_END_MIN,
+                rate_per_min: (1.0 - PRIMARY_PEAK_SHARE) * count / secondary_span,
+            },
+        ];
+
+        Self {
+            segments,
+            room_shares,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn segments(&self) -> &[ArrivalSegment] {
+        &self.segments
+    }
+
+    /// Share of patients whose package includes `room`.
+    pub fn room_share(&self, room: &str) -> f64 {
+        self.room_shares
+            .get(room)
+            .copied()
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0)
+    }
+
+    /// Expected number of new patients needing `room` between two wall-clock
+    /// minutes (minutes since the run started), integrating each window.
+    pub fn expected_arrivals(&self, room: &str, from_min: f64, to_min: f64) -> f64 {
+        if to_min <= from_min {
+            return 0.0;
+        }
+        let share = self.room_share(room);
+        if share <= 0.0 {
+            return 0.0;
+        }
+        self.segments
+            .iter()
+            .map(|segment| {
+                let start = segment.start_min.max(from_min);
+                let end = segment.end_min.min(to_min);
+                (end - start).max(0.0) * segment.rate_per_min * share
+            })
+            .sum()
+    }
+}
 
 pub fn demo_scenario() -> Scenario {
     // Wings are far apart on the hospital map; rooms inside a wing sit within
@@ -235,5 +329,43 @@ mod tests {
         }
         assert!((scenario.walk_time_between("blood_test", "ecg") - 1.375).abs() < 1e-9);
         assert!(scenario.walk_time_between("blood_test", "ecg") < scenario.walk_time_between("blood_test", "cardiology"));
+    }
+
+    #[test]
+    fn arrival_demand_conserves_patients_and_respects_the_lull() {
+        let scenario = demo_scenario();
+        let demand = ArrivalDemand::from_scenario(&scenario, DEFAULT_PATIENT_COUNT);
+        let total: f64 = demand
+            .segments()
+            .iter()
+            .map(|segment| segment.rate_per_min * (segment.end_min - segment.start_min))
+            .sum();
+        assert!((total - DEFAULT_PATIENT_COUNT as f64).abs() < 1e-9);
+
+        // The primary window carries more patients in total (the secondary is
+        // denser per minute but only 60 minutes long); the gap and tail are quiet.
+        let primary = demand.segments()[0];
+        let secondary = demand.segments()[1];
+        let primary_total = primary.rate_per_min * (primary.end_min - primary.start_min);
+        let secondary_total = secondary.rate_per_min * (secondary.end_min - secondary.start_min);
+        assert!(primary_total > secondary_total);
+        assert_eq!(demand.expected_arrivals("blood_test", 120.0, 150.0), 0.0);
+        assert_eq!(demand.expected_arrivals("blood_test", 210.0, 300.0), 0.0);
+        assert!(demand.expected_arrivals("blood_test", 0.0, 20.0) > 0.0);
+        assert!(demand.expected_arrivals("blood_test", 150.0, 170.0) > 0.0);
+    }
+
+    #[test]
+    fn room_shares_follow_package_popularity() {
+        let demand = ArrivalDemand::from_scenario(&demo_scenario(), DEFAULT_PATIENT_COUNT);
+        // Blood Test appears in four of five packages, ENT in two.
+        assert!((demand.room_share("blood_test") - 0.80).abs() < 1e-9);
+        assert!((demand.room_share("ent") - 0.45).abs() < 1e-9);
+        assert!((demand.room_share("eye_exam") - 0.45).abs() < 1e-9);
+        assert!((demand.room_share("ultrasound") - 0.30).abs() < 1e-9);
+        assert!(
+            demand.expected_arrivals("blood_test", 0.0, 30.0)
+                > demand.expected_arrivals("ent", 0.0, 30.0)
+        );
     }
 }
