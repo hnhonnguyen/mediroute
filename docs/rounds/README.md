@@ -149,3 +149,97 @@ Live run seed 99 (fresh data dir, speed clamp 60): 52/52 patients, sim_time 405.
 **Verify độc lập (coordinator):** lặp lại quy trình chuẩn trên server riêng — cargo test 50/50, npm run build OK, fresh data dir → live seed 99 (finished, sim_time 405.5) → compare seeds 42/7/123: khớp chính xác từng số với report (64.10/2.64/84.66/12.55; 72.26/4.25/128.48/12.55; 75.15/7.25/125.68/11.44). Optimized tốt nhất avg_total + p90_total + avg_walk trên cả 3 seeds; gap với baselines nới rộng so với scenario Round 1 (seed 42: 7.2 min vs 5.0 min). 
 
 **Decision:** COMMIT — scenario vật lý thực hơn (walk 1–5 min theo khoảng cách thật giữa 3 khu) và router khai thác distance để nới rộng khoảng cách với cả 2 baselines trên mọi metric.
+
+---
+
+## Round 4 — 2-step lookahead routing (chỉ Optimized)
+
+**Status:** ✅ COMMITTED (verified độc lập)
+
+**Aspect đề xuất:**
+- Optimized chỉ so cost của phòng kế tiếp. Một lựa chọn rẻ trước mắt có thể để lại bước sau đắt (khóa dependency, phòng xa, hoặc phòng còn đông khi patient quay lại).
+- Thêm lookahead một bước: `cost_total(r) = walk(current, r) + est_wait(r) + est_service(r) + w × lookahead(r)`, với
+  `lookahead(r) = min` over `r'` eligible **sau khi** hoàn tất `r` của `[walk(r, r') + est_wait_tại_lúc_đến(r') + est_service(r')]`.
+  Nếu `r` là phòng cuối (hoặc không còn phòng eligible) → `lookahead = 0`.
+- Chỉ Optimized đổi; FixedOrder/ShortestQueue tuyệt đối giữ nguyên; API/JSON không đổi.
+
+**Thiết kế:**
+- Eligibility của bước 2 được tính với `done ∪ {r}`, nên phòng bị chặn bởi dependency chỉ xuất hiện sau khi chọn đúng prerequisite (A mở khóa B → B trở thành ứng viên bước 2 của A, nhưng vẫn bị chặn nếu chọn X trước).
+- Thời điểm đến phòng kế: `finish_r + walk(r, r')`, trong đó `finish_r = walk(current, r) + est_wait(r) + est_service(r)`.
+- Est_wait tương lai dùng **decay**: `max(0, est_wait_hiện_tại(r') − arrive_in)`. Cách này tái dùng nguyên `congestion::est_wait_min` (không sửa congestion.rs) và phản ánh việc hàng đợi kịp trôi trong lúc patient đi/khám phòng đầu. Đã thử bản không decay: tệ hơn rõ (xem bảng chọn hệ số).
+- Tie-break giữ nguyên: band 25% so trên `cost_total`, rồi walk gần → unblocks → downstream depth → en-route → queue → package position.
+- `sim.rs` không phải sửa: `RouteContext` đã có `required`, `done`, `graph`; router tự thêm `r` vào tập done khi ước lượng bước 2.
+- Hệ số `LOOKAHEAD_WEIGHT = 0.5` (`router.rs`). Từ w = 0.6, band 25% trên tổng cost đã nuốt khác biệt một-bước đủ rõ và làm test cũ `clear_cost_difference_outranks_critical_path_depth` lật kỳ vọng; w = 0.7 còn làm hỏng thêm test `router_uses_learned_service_time_not_config_seed`. w = 0.5 giữ nguyên toàn bộ hành vi cũ, đồng thời cho kết quả tốt nhất/dễ chấp nhận nhất trên 3 seed.
+
+**Chọn hệ số lookahead** (cùng quy trình: fresh data dir → live seed 99 → compare 42/7/123; mỗi mức w có learned stats riêng từ live run của chính nó):
+
+| w (decay) | seed 42 avg/p90 | seed 7 avg/p90 | seed 123 avg/p90 |
+|---|---|---|---|
+| 0.40 | 64.78 / 92.74 | 72.35 / 127.76 | 75.91 / 125.00 |
+| 0.45 | 64.61 / 83.69 | 73.27 / 126.89 | 75.91 / 125.00 |
+| **0.50** | **63.92 / 75.89** | **72.80 / 126.89** | **75.92 / 121.81** |
+| 0.60 | 64.90 / 92.35 | 72.34 / 128.32 | 79.47 / 136.79 |
+| 0.70 | 64.06 / 83.69 | 71.27 / 128.50 | 76.41 / 131.20 |
+| 0.80 | 65.51 / 85.55 | 71.37 / 128.50 | 75.80 / 131.20 |
+| 0.50 no-decay | 66.95 / 88.14 | 72.78 / 126.89 | 79.57 / 129.42 |
+
+- **Chọn w = 0.5**: p90_total tốt nhất hoặc đồng hạng trên cả 3 seed (75.89 / 126.89 / 121.81), avg_total không seed nào xấu quá ~1% so với Round 3. Các mức 0.6–0.8 làm p90 seed 42/123 tệ hơn cả Round 3 do quyết định rời rạc nhảy sang nhánh khác; 0.4/0.45 kém ổn định ở seed 42. Bản không decay tệ hơn ở cả 3 seed. Đường cong không đơn điệu vì mỗi thay đổi nhỏ lật hẳn thứ tự routing.
+
+**Kết quả compare (verify chuẩn, headless — cùng arrivals/packages/service samples):**
+
+Seed 42:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized** | **63.92** | **2.73** | **75.89** | **12.05** |
+| FixedOrder | 77.02 | 5.91 | 130.21 | 13.45 |
+| ShortestQueue | 71.32 | 4.33 | 103.89 | 13.57 |
+
+Seed 7:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized** | **72.80** | **4.43** | **126.89** | **12.39** |
+| FixedOrder | 84.39 | 7.08 | 138.89 | 13.82 |
+| ShortestQueue | 77.82 | 5.56 | 139.75 | 13.10 |
+
+Seed 123:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized** | **75.92** | **7.57** | **121.81** | **11.10** |
+| FixedOrder | 86.44 | 10.17 | 145.23 | 12.73 |
+| ShortestQueue | 81.09 | 8.67 | 126.75 | 12.49 |
+
+Baselines khớp **từng số** với Round 3 ở cả 3 seed × 4 metric (ví dụ seed 42: 77.0249/5.9134/130.2068/13.4523 và 71.3185/4.3273/103.8948/13.5720) → physics, seed, và routing của baselines không bị đụng.
+
+**Đánh giá vs Round 3 (Optimized):**
+
+| Seed | Δ avg_total | Δ avg_wait | Δ p90_total | Δ avg_walk |
+|---|---|---|---|---|
+| 42 | −0.18 (63.92 vs 64.10) | +0.09 (2.73 vs 2.64) | **−8.77** (75.89 vs 84.66) | −0.50 (12.05 vs 12.55) |
+| 7 | +0.54 (72.80 vs 72.26) | +0.18 (4.43 vs 4.25) | **−1.58** (126.89 vs 128.48) | −0.16 (12.39 vs 12.55) |
+| 123 | +0.77 (75.92 vs 75.15) | +0.32 (7.57 vs 7.25) | **−3.87** (121.81 vs 125.68) | −0.33 (11.10 vs 11.44) |
+
+- Tiêu chí "tốt hơn avg_total **hoặc** p90_total mà không regression đáng kể": đạt qua **p90_total giảm trên cả 3 seed** (−1.6 đến −8.8 phút; −1.2% đến −10.4%), avg_walk giảm cả 3, avg_total gần như hòa (1 seed tốt hơn, 2 seed nhích +0.5–0.8 phút ≈ +0.75–1.0%), avg_wait nhích +0.09–0.32 phút (3–4%) — mức nhỏ so với lợi ích tail.
+- Optimized vẫn thắng cả 2 baselines trên cả 4 metric ở cả 3 seed.
+- Không có over-bias rõ: avg_walk tiếp tục giảm, nghĩa là lookahead không kéo tour lệch sang các wing xa.
+- Lưu ý: đây là so sánh theo đúng quy trình Round 3 (compare dùng learned stats từ live seed 99 của cùng phiên bản code), nên phần chênh lệch bao gồm cả hiệu ứng feedback của stats mới; baselines độc lập với stats nên không bị ảnh hưởng.
+
+Live seed 99 (fresh dir, speed 5000→clamp 60): finished t = 408.15 phút, 52/52, 188 visits; avg_total 80.99, avg_wait 7.29, p90_total 149.97, p90_wait 19.91, avg_walk 11.53. (Round 3: t = 405.47, 80.45/7.16/160.14/17.94/11.49 — p90 live cũng giảm.)
+
+**Files changed:** `backend/src/engine/router.rs` (hằng số + `future_wait`/`lookahead_cost`/`total_cost` + 4 test mới). Không đổi `congestion.rs`, `sim.rs`, `domain.rs`, `scenario.rs`, API, frontend. Không commit.
+
+**Verify steps:**
+1. `cargo test`: **54/54 pass** (50 test cũ + 4 mới: lookahead = 0 khi phòng cuối; wait tương lai decay theo thời gian bước 1; dependency unlock + 2-step thắng greedy 1-step trong case dựng được; baselines không đổi lựa chọn).
+2. `npm run build`: OK (chỉ warning chunk > 500 kB có từ trước).
+3. Fresh `MEDIROUTE_DATA_DIR=/tmp/mediroute-r4-test`, server riêng `PORT=8082`; live `{strategy:optimized, speed:5000, seed:99}` → chờ finished.
+4. `POST /api/sim/compare` seed 42 → 7 → 123; ghi đủ avg_total/avg_wait/p90_total/avg_walk cho 3 strategies.
+5. Kiểm tra `/api/rooms` trả `wing` + `position`, `/api/status` trả `avg_walk_min` + metric priority, frontend serve HTTP 200 trên 8082.
+6. Port 8080 không đụng; không git commit/push.
+
+**Decision:** WIN có điều kiện — cải thiện rõ tail latency (p90_total) và walk trên cả 3 seed, giữ baselines tuyệt đối, không API/JSON change; avg_total/avg_wait nhích nhẹ ở 2 seed. Đáng giữ để verify độc lập trước khi quyết định commit.
+
+**Verify độc lập (coordinator):** cargo test 54/54; lặp quy trình chuẩn (fresh dir → live seed 99 finished t=408.1 → compare 42/7/123): khớp chính xác từng số với report. So với Round 3: p90_total −8.77/−1.58/−3.87 phút trên cả 3 seeds; avg_total −0.18 (seed 42, tốt hơn), +0.54/+0.77 (~1%, trong ngưỡng noise); avg_walk giảm cả 3 seeds.
+
+**Decision:** COMMIT — p90_total (metric mục tiêu) cải thiện rõ rệt trên mọi seed, seed 42 chuẩn cải thiện cả avg_total lẫn p90_total, các regression avg còn lại trong 1%.

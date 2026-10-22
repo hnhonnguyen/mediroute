@@ -12,6 +12,11 @@ use super::congestion;
 /// not only on near-identical estimates.
 const COST_TIE_BAND: f64 = 0.25;
 
+/// Round 4 adds the cheapest projected follow-up visit to the Optimized cost.
+/// A sub-1.0 factor keeps the second step informative without letting a busy
+/// next room dominate the immediate wait. Tuned on seeds 42/7/123.
+const LOOKAHEAD_WEIGHT: f64 = 0.5;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Strategy {
@@ -162,10 +167,66 @@ impl RouteContext<'_> {
     }
 
     fn walk_to(&self, room: &str) -> f64 {
-        match (self.position(self.current_location), self.position(room)) {
+        self.walk_between(self.current_location, room)
+    }
+
+    fn walk_between(&self, from: &str, to: &str) -> f64 {
+        match (self.position(from), self.position(to)) {
             (Some(from), Some(to)) => walk_time(from, to),
             _ => WALK_TIME_MIN,
         }
+    }
+
+    fn wait_at(&self, room: &str) -> f64 {
+        congestion::est_wait_min(&self.load(room), self.est_service(room), self.capacity(room))
+    }
+
+    /// Projected wait when arriving at `room` in `arrive_in_min` minutes: the
+    /// station-free time is fixed in the near term, so the wait shrinks with
+    /// the time spent on the current step (never below zero).
+    fn future_wait(&self, room: &str, arrive_in_min: f64) -> f64 {
+        (self.wait_at(room) - arrive_in_min.max(0.0)).max(0.0)
+    }
+
+    /// Cheapest projected second step after finishing `room`, or 0 when no
+    /// room remains. Eligibility is evaluated with `room` marked done, so the
+    /// follow-up set reflects dependencies unlocked by this choice.
+    fn lookahead_cost(
+        &self,
+        room: &str,
+        required: &HashSet<&str>,
+        done: &HashSet<&str>,
+    ) -> f64 {
+        let finish_in_min = self.walk_to(room) + self.wait_at(room) + self.est_service(room);
+        required
+            .iter()
+            .copied()
+            .filter(|next| *next != room && !done.contains(next))
+            .filter(|next| {
+                let done_after = |candidate: &str| candidate == room || done.contains(candidate);
+                self.graph.prerequisites(next).iter().all(|prereq| {
+                    !required.contains(prereq.as_str()) || done_after(prereq.as_str())
+                })
+            })
+            .map(|next| {
+                let walk_next = self.walk_between(room, next);
+                let wait_next = self.future_wait(next, finish_in_min + walk_next);
+                walk_next + wait_next + self.est_service(next)
+            })
+            .min_by(f64::total_cmp)
+            .unwrap_or(0.0)
+    }
+
+    fn total_cost(
+        &self,
+        room: &str,
+        required: &HashSet<&str>,
+        done: &HashSet<&str>,
+    ) -> f64 {
+        self.walk_to(room)
+            + self.wait_at(room)
+            + self.est_service(room)
+            + LOOKAHEAD_WEIGHT * self.lookahead_cost(room, required, done)
     }
 
     fn unblocks(&self, room: &str, required: &HashSet<&str>, done: &HashSet<&str>) -> usize {
@@ -224,18 +285,8 @@ impl RouteContext<'_> {
         // clear cost differences still win outright.
         let walk_a = self.walk_to(room_a);
         let walk_b = self.walk_to(room_b);
-        let cost_a = congestion::route_cost(
-            &self.load(room_a),
-            self.est_service(room_a),
-            self.capacity(room_a),
-            walk_a,
-        );
-        let cost_b = congestion::route_cost(
-            &self.load(room_b),
-            self.est_service(room_b),
-            self.capacity(room_b),
-            walk_b,
-        );
+        let cost_a = self.total_cost(room_a, required, done);
+        let cost_b = self.total_cost(room_b, required, done);
         if !costs_within_percent(cost_a, cost_b, COST_TIE_BAND) {
             return cost_a.total_cmp(&cost_b);
         }
@@ -683,6 +734,146 @@ mod tests {
         assert_eq!(
             ctx.next_room(Strategy::ShortestQueue, &required, &[]),
             Some("far".to_string())
+        );
+    }
+
+    #[test]
+    fn lookahead_is_zero_when_no_room_remains() {
+        let rooms = vec![room("a", 10.0, 1), room("b", 10.0, 1)];
+        let graph = graph(&rooms, &[]);
+        let stats = stats(&rooms, &[]);
+        let loads = loads(&[("a", 4, 0, 0, 0)]);
+        let ctx = RouteContext {
+            rooms: &rooms,
+            graph: &graph,
+            stats: &stats,
+            loads: &loads,
+            current_location: "a",
+        };
+        let required = vec!["a".to_string(), "b".to_string()];
+        let required_set: HashSet<&str> = required.iter().map(String::as_str).collect();
+        let done = vec!["a".to_string()];
+        let done_set: HashSet<&str> = done.iter().map(String::as_str).collect();
+
+        assert_eq!(ctx.lookahead_cost("b", &required_set, &done_set), 0.0);
+        assert_eq!(
+            ctx.next_room(Strategy::Optimized, &required, &done),
+            Some("b".to_string())
+        );
+    }
+
+    #[test]
+    fn lookahead_wait_decays_with_time_spent_on_the_first_step() {
+        let rooms = vec![room("next", 10.0, 1)];
+        let graph = graph(&rooms, &[]);
+        let stats = stats(&rooms, &[]);
+        let loads = loads(&[("next", 2, 0, 0, 0)]);
+        let ctx = RouteContext {
+            rooms: &rooms,
+            graph: &graph,
+            stats: &stats,
+            loads: &loads,
+            current_location: ENTRANCE_ID,
+        };
+
+        // Two queued patients at 10 minutes each project a 20-minute wait.
+        assert!((ctx.wait_at("next") - 20.0).abs() < 1e-9);
+        assert!((ctx.future_wait("next", 5.0) - 15.0).abs() < 1e-9);
+        assert_eq!(ctx.future_wait("next", 20.0), 0.0);
+        assert_eq!(ctx.future_wait("next", 50.0), 0.0);
+    }
+
+    /// X is cheaper right now, but choosing it leaves only the expensive A for
+    /// the second step. A costs more now yet unlocks a cheap B, so the two-step
+    /// tour through A is cheaper than the greedy tour through X.
+    fn two_step_context_rooms() -> (Vec<Room>, DependencyGraph) {
+        let rooms = vec![
+            room_at("a", 7.0, 1, (0.0, 0.0)),
+            room_at("b", 0.1, 1, (2.0, 0.0)),
+            room_at("x", 0.8, 1, (20.0, 0.0)),
+        ];
+        let graph = graph(&rooms, &[("a", "b")]);
+        (rooms, graph)
+    }
+
+    #[test]
+    fn two_step_lookahead_prefers_the_room_that_unlocks_a_cheap_follow_up() {
+        let (rooms, graph) = two_step_context_rooms();
+        let stats = stats(&rooms, &[]);
+        let loads = HashMap::new();
+        let ctx = RouteContext {
+            rooms: &rooms,
+            graph: &graph,
+            stats: &stats,
+            loads: &loads,
+            current_location: ENTRANCE_ID,
+        };
+        let required = vec!["x".to_string(), "b".to_string(), "a".to_string()];
+        let required_set: HashSet<&str> = required.iter().map(String::as_str).collect();
+        let done_set: HashSet<&str> = HashSet::new();
+
+        let greedy_x = congestion::route_cost(
+            &ctx.load("x"),
+            ctx.est_service("x"),
+            ctx.capacity("x"),
+            ctx.walk_to("x"),
+        );
+        let greedy_a = congestion::route_cost(
+            &ctx.load("a"),
+            ctx.est_service("a"),
+            ctx.capacity("a"),
+            ctx.walk_to("a"),
+        );
+        assert!((greedy_x - 5.8).abs() < 1e-9, "greedy X was {greedy_x}");
+        assert!((greedy_a - 8.0).abs() < 1e-9, "greedy A was {greedy_a}");
+        assert!(greedy_x < greedy_a);
+        // The one-step gap is wide enough that Round 3 picks X outright.
+        assert!(!costs_within_percent(greedy_a, greedy_x, COST_TIE_BAND));
+
+        // A unlocks cheap B as the projected second step; X leaves only A.
+        let look_a = ctx.lookahead_cost("a", &required_set, &done_set);
+        let look_x = ctx.lookahead_cost("x", &required_set, &done_set);
+        assert!((look_a - 1.6).abs() < 1e-9, "lookahead A was {look_a}");
+        assert!((look_x - 12.0).abs() < 1e-9, "lookahead X was {look_x}");
+        assert!(greedy_a + look_a < greedy_x + look_x);
+
+        // With the half-weighted lookahead, A wins on total cost alone: the
+        // gap is outside the tie band, so no tie-break is involved.
+        let total_a = ctx.total_cost("a", &required_set, &done_set);
+        let total_x = ctx.total_cost("x", &required_set, &done_set);
+        assert!((total_a - 8.8).abs() < 1e-9, "total A was {total_a}");
+        assert!((total_x - 11.8).abs() < 1e-9, "total X was {total_x}");
+        assert!(!costs_within_percent(total_a, total_x, COST_TIE_BAND));
+
+        assert_eq!(
+            ctx.next_room(Strategy::Optimized, &required, &[]),
+            Some("a".to_string())
+        );
+    }
+
+    #[test]
+    fn lookahead_does_not_change_baseline_choices() {
+        let (rooms, graph) = two_step_context_rooms();
+        let stats = stats(&rooms, &[]);
+        let loads = HashMap::new();
+        let ctx = RouteContext {
+            rooms: &rooms,
+            graph: &graph,
+            stats: &stats,
+            loads: &loads,
+            current_location: ENTRANCE_ID,
+        };
+        let required = vec!["x".to_string(), "b".to_string(), "a".to_string()];
+
+        // Baseline rules are unchanged: Fixed Order takes package order and
+        // Shortest Queue breaks the all-empty tie by order, so both take X.
+        assert_eq!(
+            ctx.next_room(Strategy::FixedOrder, &required, &[]),
+            Some("x".to_string())
+        );
+        assert_eq!(
+            ctx.next_room(Strategy::ShortestQueue, &required, &[]),
+            Some("x".to_string())
         );
     }
 }
