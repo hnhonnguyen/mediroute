@@ -1909,3 +1909,107 @@ h = walk(now → room) + wait_at(room)     // horizon tới lúc bệnh nhân d�
 **Decision:** **DISCARD — không thay đổi code.** Giả thuyết mở rộng min-cap sang rush phụ bị bác bỏ ở mức outcome: 41 cấu hình, zero cấu hình cải thiện mean p90; full window còn xóa đúng gain tail R17 trên s5. Working tree chỉ giữ section docs này để coordinator đối chiếu.
 
 **Bài học:** (1) Calibration (bias/MAE) là điều kiện cần nhưng không đủ: estimator tốt hơn theo từng quyết định vẫn có thể làm routing tệ hơn vì thay đổi thứ tự chọn phòng, đặc biệt khi lookahead/σ vẫn dùng estimator cũ — phải benchmark outcome, không suy diễn từ calibration. (2) Min-cap của R17 hiệu quả trong một phạm vi hẹp; mở rộng sang rush phụ không những không cộng thêm gain mà còn xóa gain cũ (s5 +16.98, đúng về mức R16), nên biên cửa sổ là một phần của thiết kế. (3) Khi hypothesis thất bại, sweep đủ rộng (window/anchor/formula/damping) và báo DISCARD trung thực là kết quả đúng — không ép một biến thể "gần đạt" thành commit.
+
+## Round 20 — Estimator consistency (first-step ↔ lookahead/σ)
+
+**Status:** ❌ DISCARD — giả thuyết đồng bộ estimator bị bác bỏ ở mức outcome: **9 cấu hình (control + 8 biến thể) chạy đủ protocol 5 seeds, không cấu hình nào cải thiện mean p90 129.9813**. A1/C giữ nguyên p90 nhưng tăng mean avg +0.076%; A2 (min-cap second hop) làm mean p90 +2.5601 (+1.97%), riêng s42 +12.80; B (σ horizon) thay đổi σ nhưng không đổi một quyết định nào. Không thay đổi code routing; working tree chỉ thêm section docs này.
+
+**Aspect đề xuất:**
+- Chẩn đoán R19: sau R17, first-step wait trong `[100,150)` dùng `min(wait_at, demand_wait@ETA)`, nhưng hai chỗ khác của cùng cost function vẫn dùng `wait_at` thô:
+  - `lookahead_cost` tính `finish_in_min = walk + wait_at + service`, nên ETA của second hop bị đẩy muộn theo phần over-prediction;
+  - `wait_sigma` dùng `horizon = walk + wait_at` (horizon chỉ ảnh hưởng arrival variance và filter likely arrivals).
+- Hypothesis: nếu R17 đúng vì cắt walk-double-count/over-prediction, thì các thành phần khác của cost bị cùng bias và nên được đồng bộ trong **đúng cửa sổ R17 hiện có** `[100,150)`: `lookahead_cost` dùng min-capped wait tại ETA (first hop: ETA; second hop: 2-step ETA) và/hoặc `wait_sigma` dùng min-capped wait trong horizon, giữ cơ chế "chỉ giảm, không inflate". Không mở rộng cửa sổ (R19 đã bác bỏ hướng đó).
+
+**Thiết kế sweep (tạm, đã revert hoàn toàn):**
+- `#[cfg(test)] mod sweep` trong `router.rs`: bit `LOOKAHEAD_FINISH` (A1: `finish_in_min` dùng `first_step_wait`), `LOOKAHEAD_CAP` (A2: `wait_next = min(future_wait@ETA2, wait_at)` trong cửa sổ), `SIGMA_HORIZON` (B: horizon dùng `first_step_wait`), `ETA_ANCHOR` (gate A1/B theo `now + walk ∈ [100,150)` thay vì `now`). Hai helper temporary `lookahead_first_wait` / `sigma_wait` chỉ thay `wait_at` bằng `first_step_wait` khi bit bật; non-test build giữ nguyên HEAD.
+- Harness `#[ignore]` trong `sim.rs` tái hiện protocol server: fresh learner → live Optimized seed 99 **dưới từng biến thể** → stats snapshot → compare 5 seeds × 3 strategies.
+- Control tái tạo **bit-identical HEAD**: live `t = 408.145081`, 83.4505 / 8.0682 / 157.1367 / 20.5701 / 11.1977; mean 79.9008 / 129.9813. Baselines bất biến ở **toàn bộ 9 cấu hình** (FixedOrder/ShortestQueue khớp từng số HEAD ở 10/10 row = 5 seeds × 2 strategies, cả 4 metric).
+- 9 cấu hình: control; A1; A2; A1+A2; B; C=A1+B; C+A2; A1-ETA; C-ETA.
+
+**Variant sweep — Optimized, mean 5 seeds (mỗi cấu hình đủ protocol):**
+
+| # | Variant | Mean avg | Δ avg | Mean p90 | Δ p90 | Ghi chú |
+|---|---|---|---|---|---|---|
+| 0 | control | **79.9008** | — | **129.9813** | — | bit-identical HEAD |
+| 1 | A1 lookahead-finish | 79.9615 | +0.0607 (+0.076%) | 129.9813 | 0 | chỉ s5 avg +0.3033 |
+| 2 | A2 second-hop-cap | 80.1947 | +0.2939 (+0.368%) | 132.5414 | +2.5601 (+1.97%) | s42 p90 +12.8007 |
+| 3 | A1+A2 | 80.2553 | +0.3545 (+0.444%) | 132.5414 | +2.5601 | = A2 + A1 trên s5 |
+| 4 | B σ-horizon | **79.9008** | 0 | **129.9813** | 0 | 0 decision đổi |
+| 5 | C=A1+B | 79.9615 | +0.0607 (+0.076%) | 129.9813 | 0 | ≡ A1 |
+| 7 | C+A2 | 80.2553 | +0.3545 (+0.444%) | 132.5414 | +2.5601 | ≡ A1+A2 |
+| 9 | A1 ETA-anchor | 79.9615 | +0.0607 (+0.076%) | 129.9813 | 0 | ≡ A1 |
+| 13 | C ETA-anchor | 79.9615 | +0.0607 (+0.076%) | 129.9813 | 0 | ≡ A1 |
+
+- A1/C/A1-ETA/C-ETA chỉ đổi seed 5: avg 117.5001 → 117.8034 (+0.3033), p90 giữ 211.6310. ETA-anchor không đổi kết quả so với now-anchor.
+- A2 làm s42 p90 78.4098 → 91.2105 (+12.8007), avg 65.0999 → 65.6783; s7 avg +0.4217; s123 avg +0.1839; s5 avg +0.2853; s2024 không đổi. A1+A2/C+A2 cộng thêm +0.3033 vào s5 avg (mean avg 80.2553, +0.444%) nhưng p90 y hệt A2.
+- Live seed 99 **bit-identical ở cả 9 cấu hình** → stats snapshot giống nhau, khác biệt compare thuần routing, không có learning confound.
+
+**Diagnostics (counter tích lũy qua live + 5 seeds × 3 strategies):**
+
+| Biến thể | Cơ chế | Số lần | Độ lớn | Hệ quả |
+|---|---|---|---|---|
+| A1 | first-step cut dùng cho ETA2 | 2.970 call | tổng 2.860,36 phút; TB 0,963 phút/call | chỉ s5 đổi path; avg +0.30 |
+| A1 ETA | như trên, gate theo ETA first hop | 523 call | tổng 2.726,74 phút; TB 5,21 phút/call | kết quả ≡ A1 |
+| A2 | cap second-hop wait | 1.333 check, 220 bind (16,5%) | tổng 1.200,16 phút; TB 5,46 phút/bind | s42 p90 +12.80 |
+| B | horizon = walk + first_step_wait | 2.970 call | wait cut 2.825,00 phút; |Δσ| TB 0,0165, max 1,326 | 0 decision đổi |
+
+**Diễn giải — vì sao consistency không thắng:**
+- **A1 là bản sửa "đúng" nhưng đi ngược R17.** Khi ETA2 được tính từ `first_step_wait` (sớm hơn), `future_wait(next, ETA2)` tăng vì phòng chưa kịp drain; lookahead weighted 0.5 vì thế trả lại phần lớn khoản first-step vừa cắt. Trên seed 5 — seed duy nhất R17 min-cap thực sự đổi path — điều này lấy lại +0.3033 avg mà không cải thiện p90. Nói cách khác: inconsistency cũ (ETA2 muộn) đang vô tình bảo toàn lợi ích first-step của R17.
+- **A2 cho thấy lookahead conservatism là có chức năng.** Cap `wait_next` xuống `wait_at` bind chủ yếu ở các follow-up đang nóng (TB cắt 5,46 phút mỗi lần bind), làm bước hai trông rẻ hơn thực tế và dụ path của s42 vào tour có tail dài: p90 +12.80. Đây đúng cảnh báo trong hypothesis — min-cap ở 2-step ETA over-cut vì lookahead ước lượng xa hơn và cần conservative hơn, không phải cùng loại bias với first-step.
+- **B làm đúng phép đồng bộ nhưng σ không có đòn bẩy trong cửa sổ.** `wait_sigma_min` chỉ dùng horizon cho arrival variance và filter likely arrivals; queue variance (phần chi phối) phụ thuộc số job phía trước, không phụ thuộc horizon. Trong lull `[120,150)` λ = 0 nên arrival variance = 0; ở peak-edge horizon ngắn nên thay đổi nhỏ. Kết quả: |Δσ| trung bình 0,0165 phút, max 1,326; với κ = 0.5, tác động cost tối đa 0,663 phút — không đủ để đổi bất kỳ lựa chọn nào trên 5 seeds. Vì vậy C ≡ A1.
+- **Không có biến thể nào cải thiện p90**, kể cả khi siết anchor theo ETA hay ghép cả ba thành phần. Hypothesis đúng về mặt số học (các estimator lệch nhau thật) nhưng sai về mặt hành vi: mỗi thành phần phục vụ một vai trò khác nhau (first-step = mean estimate; lookahead = đánh giá xa, cần conservative; σ = spread quanh số job phía trước), nên "cùng bias" không đồng nghĩa "cùng cách sửa".
+
+**Compare 5 seeds trên final tree** (HEAD, không đổi code — bit-identical R17/R18/R19):
+
+| Seed | Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|---|
+| 42 | **Optimized** | **65.0999** | **3.1666** | **78.4098** | **11.6167** |
+| 42 | Fixed Order | 77.0249 | 5.9134 | 130.2068 | 13.4523 |
+| 42 | Shortest Queue | 71.3185 | 4.3273 | 103.8948 | 13.5720 |
+| 7 | **Optimized** | **73.6461** | **4.8477** | **128.1961** | **11.6399** |
+| 7 | Fixed Order | 84.3898 | 7.0846 | 138.8932 | 13.8233 |
+| 7 | Shortest Queue | 77.8194 | 5.5577 | 139.7541 | 13.0962 |
+| 123 | **Optimized** | **73.2556** | **6.8929** | **116.3665** | **10.7541** |
+| 123 | Fixed Order | 86.4409 | 10.1679 | 145.2265 | 12.7288 |
+| 123 | Shortest Queue | 81.0868 | 8.6726 | 126.7505 | 12.4931 |
+| 5 | **Optimized** | **117.5001** | **16.9063** | **211.6310** | **11.5661** |
+| 5 | Fixed Order | 124.1452 | 18.3369 | 240.2734 | 12.9288 |
+| 5 | Shortest Queue | 119.3817 | 16.9931 | 246.6130 | 13.1272 |
+| 2024 | **Optimized** | **70.0024** | **4.0933** | **115.3030** | **11.6839** |
+| 2024 | Fixed Order | 79.4512 | 6.0142 | 144.2094 | 13.8921 |
+| 2024 | Shortest Queue | 74.2294 | 4.8259 | 124.3680 | 13.1494 |
+
+- Mean 5 seeds (Optimized): avg_total **79.9008**, avg_wait 7.1813, p90_total **129.9813**, avg_walk 11.4521; FixedOrder 90.2904 / 9.5034 / 159.7619 / 13.3650; ShortestQueue 84.7672 / 8.0753 / 148.2761 / 13.0876.
+- Live seed 99: finished `t = 408.145081`, 52/52, 188 visits, 83.4505 / 8.0682 / 157.1367 / 20.5701 / 11.1977 — bit-identical R17/R18/R19.
+
+**Đánh giá theo tiêu chí:**
+- **(a) Mean p90_total 5 seeds tốt hơn 129.9813: ❌ KHÔNG ĐẠT** — không cấu hình nào tốt hơn; tốt nhất là hòa 129.9813 (control/B), A2 +2.5601, A1/C +0.
+- **(b) Mean avg_total không tệ hơn 1%: ✅ ĐẠT** — mọi biến thể trong +0.444%; A1/C +0.076%, A2 +0.368%.
+- **(c) Optimized #1 mọi seed mọi metric chính: ✅ ĐẠT 10/10 ô ở mọi biến thể** (A2 vẫn #1: s42 65.68 < 71.32, p90 91.21 < 103.89; s5 117.79/118.09 < 119.38).
+- **Không có candidate nào đạt cả 3 tiêu chí → DISCARD theo protocol.** Đây là kết quả âm hợp lệ; final tree không đổi so với HEAD.
+
+**Tests:**
+- `cargo test`: **87/87 pass** trước khi instrument và sau khi revert. Không thêm test production vì không giữ thay đổi logic nào (R18/R19 precedent).
+- `#[cfg(test)] mod sweep` trong `router.rs`, hai helper temporary và harness `#[ignore]` trong `sim.rs` đã revert hoàn toàn; `git diff` cuối cùng chỉ chứa `docs/rounds/README.md`.
+
+**Files changed:** `docs/rounds/README.md` (section này). Không đổi `router.rs`, `congestion.rs`, `sim.rs`, `api.rs`, `main.rs`, `domain.rs`, `scenario.rs`, `stats.rs`, `learn.rs`, frontend, baselines, serving/FIFO, priority, downtime, learning, API/JSON, tie-band, lookahead, σ term.
+
+**Verify steps:**
+1. `cd backend && ~/.local/bin/cargo test` → **87/87 pass** (HEAD và sau revert).
+2. Baseline tại HEAD: fresh `MEDIROUTE_DATA_DIR=/tmp/mediroute-r20-test`, server riêng `PORT=8082` (không đụng 8080), live `{strategy:optimized, speed:5000, seed:99}` → `t = 408.145081`, 52/52, 188 visits, metrics như trên; compare 42/7/123/5/2024 khớp R17/R18/R19 từng số.
+3. Sweep: `#[cfg(test)]` config + harness `#[ignore]`; 9 cấu hình, mỗi cấu hình fresh learner → live seed 99 dưới biến thể → stats snapshot → 5 seeds × 3 strategies; control bit-identical HEAD; baselines bất biến toàn batch.
+4. Final verify trên tree đã revert: fresh `/tmp/mediroute-r20-final`, `PORT=8082`, live seed 99 → bit-identical HEAD; compare 5 seeds → bảng trên.
+5. Revert instrumentation; `git status` sạch (chỉ docs); port 8080 không đụng; server 8082 đã dừng; **không git commit/push**.
+
+**Decision:** **DISCARD — không thay đổi code.** Giả thuyết estimator consistency bị bác bỏ ở mức outcome: 9 cấu hình, zero cấu hình cải thiện mean p90; A1/C trung tính đến hơi tệ (avg +0.076%), A2 làm tail s42 tệ rõ (+12.80), B không có đòn bẩy routing. Working tree chỉ giữ section docs này để coordinator đối chiếu.
+
+**Bài học:** (1) Consistency là tính chất của model, không tự động là tính chất của outcome: có thể sửa đúng một inconsistency thật (A1/B) mà kết quả không đổi hoặc tệ hơn, vì mỗi thành phần cost phục vụ một vai trò khác nhau. (2) Lookahead conservatism là load-bearing cho tail: cap second hop xuống (A2) không "đồng bộ" mà chỉ che congestion ở bước kế tiếp, và trả giá bằng p90 +12.80 trên s42; ngược lại σ horizon gần như không có leverage vì queue variance không phụ thuộc horizon và lull có λ = 0. (3) Sau 3 round liên tiếp không thể vượt R17 bằng cách mở rộng/đồng bộ min-cap, kết luận trung thực là R17 đã đạt điểm cân bằng cục bộ tốt cho cost model hiện tại; muốn cải thiện p90 phải đổi trục khác (serving/priority/scenario) chứ không phải tinh chỉnh thêm các estimator trong cùng cửa sổ.
+
+## Tổng kết 20 rounds
+
+- **20 rounds: 7 commit + 13 discard.** Commit: R1 (predictive routing + rush/lull/downtime/priority), R3 (distance-aware walk matrix), R4 (2-step lookahead), R8 (time-aware future congestion), R10 (downtime pricing), R16 (mean-variance σ), R17 (post-peak min-cap). Discard: R2, R5, R6, R7, R9, R11, R12, R13, R14, R15, R18, R19, R20.
+- **Hành trình metrics chính:** baseline commit `9ecc85b` seed 42: 101.1 / 13.4 / 146.9 (avg_total / avg_wait / p90_total; scenario cũ, arrivals trải đều). Sau khi scenario chuyển sang hai rush + lull (R1) và các cải tiến lõi R3/R4/R8/R10/R16/R17: seed 42 tại HEAD `65.0999 / 3.1666 / 78.4098`. Từ khi chuẩn hóa protocol 5 seeds: R10-era mean `79.1642 / 135.1871` → R16 `79.1771 / 133.3764` → **R17 `79.9008 / 129.9813`** (mean avg / mean p90). Live seed 99 tại HEAD: `83.4505 / 8.0682 / 157.1367`, walk `11.1977`, 188 visits. So sánh tuyệt đối baseline → HEAD gồm cả thay đổi scenario (R1), nên tín hiệu công bằng là khoảng cách với 2 baselines trên cùng arrivals: Optimized hiện #1 cả avg lẫn p90 ở 5/5 seeds (10/10 ô).
+- **3 bài học lớn nhất:**
+  1. **Thay đổi cấu trúc thắng tinh chỉnh vi mô.** Bước nhảy lớn nhất đến từ scenario thực + predictive routing + walk matrix + lookahead/future-congestion (R1/R3/R4/R8); các round pricing sau đó (R10/R16/R17) chỉ cải thiện p90 từng phần và rất nhạy protocol. 13/20 round bị discard là chi phí hợp lý để giữ hệ thống không regression.
+  2. **Outcome benchmark là trọng tài, không phải calibration hay lý thuyết.** R18/R19/R20 đều có cơ chế "đúng" theo calibration hoặc nhất quán nội bộ nhưng không thắng p90; ngược lại R17 thắng nhờ min-cap hẹp trong đúng cửa sổ đo được bias. Muốn kết luận phải chạy đủ 5 seeds + live seed 99 + baselines bit-identical; một "gần đạt" không đủ để commit.
+  3. **Tôn trọng closed loop và ràng buộc hệ thống.** Routing đổi làm learned stats đổi (caveat R16); đổi serving policy có thể làm p90 xấu đi hoặc giúp baselines không đối xứng, fail tiêu chí p90/#1 (R13/R14); và các estimator trong cùng cost function có vai trò khác nhau (R20). Vì vậy mọi thay đổi chỉ nên chạm Optimized, giữ physics/FIFO/priority/downtime/learning/API nguyên vẹn, và verify trên fresh data dir với baselines khớp từng số.
