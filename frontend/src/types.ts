@@ -14,6 +14,8 @@ export interface RoomConfig {
   name: string;
   initial_avg_service_min: number;
   capacity: number;
+  wing: string;
+  position: [number, number];
 }
 
 export interface DependencyEdge {
@@ -58,6 +60,7 @@ export interface Metrics {
   p90_wait_urgent_min?: number;
   avg_wait_normal_min?: number;
   p90_wait_normal_min?: number;
+  avg_walk_min?: number;
   total_visits: number;
   room_utilization: RoomUtilization[];
 }
@@ -66,6 +69,8 @@ export interface RoomView {
   id: string;
   name: string;
   capacity: number;
+  wing?: string;
+  position?: [number, number];
   initial_avg_service_min: number;
   est_service_min: number;
   est_wait_observed_avg: number;

@@ -272,12 +272,13 @@ export default function ReportView({ report, onClose }: ReportViewProps) {
       </div>
 
       <div className="mt-3 overflow-x-auto rounded-xl border border-slate-800">
-        <table className="w-full min-w-[720px] border-collapse text-left text-xs">
+        <table className="w-full min-w-[820px] border-collapse text-left text-xs">
           <thead className="bg-slate-950/50 text-[10px] uppercase tracking-[0.12em] text-slate-500">
             <tr>
               <th className="px-4 py-2.5 font-medium">Strategy</th>
               <th className="px-3 py-2.5 text-right font-medium">Avg total</th>
               <th className="px-3 py-2.5 text-right font-medium">Avg wait</th>
+              <th className="px-3 py-2.5 text-right font-medium">Avg walk</th>
               <th className="px-3 py-2.5 text-right font-medium">P90 total</th>
               <th className="px-3 py-2.5 text-right font-medium">Visits</th>
               <th className="px-3 py-2.5 text-right font-medium">Makespan</th>
@@ -304,6 +305,9 @@ export default function ReportView({ report, onClose }: ReportViewProps) {
                 </td>
                 <td className="px-3 py-2.5 text-right tabular-nums text-slate-400">
                   {formatMinutes(result.metrics.avg_wait_min)}
+                </td>
+                <td className="px-3 py-2.5 text-right tabular-nums text-slate-300">
+                  {formatMinutes(result.metrics.avg_walk_min)}
                 </td>
                 <td className="px-3 py-2.5 text-right tabular-nums text-slate-400">
                   {formatMinutes(result.metrics.p90_total_min)}

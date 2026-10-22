@@ -4,7 +4,22 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Fallback walk time for scenarios that do not define room positions.
 pub const WALK_TIME_MIN: f64 = 2.0;
+pub const ENTRANCE_ID: &str = "entrance";
+pub const ENTRANCE_POSITION: (f64, f64) = (0.0, 0.0);
+pub const MIN_WALK_MIN: f64 = 1.0;
+pub const MAX_WALK_MIN: f64 = 5.0;
+pub const WALK_MIN_PER_UNIT: f64 = 0.25;
+
+/// Walking time in minutes between two map positions: a one-minute base plus
+/// 0.25 minutes per euclidean distance unit, clamped to 1-5 minutes.
+pub fn walk_time(from: (f64, f64), to: (f64, f64)) -> f64 {
+    let dx = from.0 - to.0;
+    let dy = from.1 - to.1;
+    (MIN_WALK_MIN + WALK_MIN_PER_UNIT * (dx * dx + dy * dy).sqrt())
+        .clamp(MIN_WALK_MIN, MAX_WALK_MIN)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Room {
@@ -12,6 +27,8 @@ pub struct Room {
     pub name: String,
     pub initial_avg_service_min: f64,
     pub capacity: usize,
+    pub wing: String,
+    pub position: (f64, f64),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -63,6 +80,21 @@ impl Scenario {
 
     pub fn room(&self, id: &str) -> Option<&Room> {
         self.rooms.iter().find(|room| room.id == id)
+    }
+
+    pub fn position(&self, location: &str) -> Option<(f64, f64)> {
+        if location == ENTRANCE_ID {
+            return Some(ENTRANCE_POSITION);
+        }
+        self.room(location).map(|room| room.position)
+    }
+
+    /// Walking time between two locations (`ENTRANCE_ID` or a room id).
+    pub fn walk_time_between(&self, from: &str, to: &str) -> f64 {
+        match (self.position(from), self.position(to)) {
+            (Some(from), Some(to)) => walk_time(from, to),
+            _ => self.walk_time_min,
+        }
     }
 
     pub fn validate(&self) -> Result<DependencyGraph, DomainError> {
@@ -131,6 +163,10 @@ pub struct Patient {
     pub done_rooms: Vec<String>,
     pub status: PatientStatus,
     pub current_room: Option<String>,
+    /// Where the patient physically stands: the entrance before the first
+    /// visit, then the room whose service they most recently completed.
+    pub current_location: String,
+    pub total_walk_min: f64,
     pub enroute_since: Option<f64>,
     pub queue_joined_at: Option<f64>,
     pub departed_at: Option<f64>,
@@ -347,8 +383,21 @@ mod tests {
                 name: id.to_string(),
                 initial_avg_service_min: 10.0,
                 capacity: 1,
+                wing: "test".into(),
+                position: (0.0, 0.0),
             })
             .collect()
+    }
+
+    #[test]
+    fn walk_time_grows_with_distance_and_clamps() {
+        assert_eq!(walk_time((0.0, 0.0), (0.0, 0.0)), 1.0);
+        let near = walk_time((0.0, 0.0), (2.0, 0.0));
+        let far = walk_time((0.0, 0.0), (8.0, 0.0));
+        assert!((near - 1.5).abs() < 1e-9, "near was {near}");
+        assert!((far - 3.0).abs() < 1e-9, "far was {far}");
+        assert!(near < far);
+        assert_eq!(walk_time((0.0, 0.0), (100.0, 0.0)), MAX_WALK_MIN);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::domain::{Patient, PatientPriority, PatientStatus};
+use crate::domain::{Patient, PatientPriority, PatientStatus, ENTRANCE_ID};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RoomUtilization {
@@ -27,6 +27,7 @@ pub struct Metrics {
     pub p90_wait_urgent_min: f64,
     pub avg_wait_normal_min: f64,
     pub p90_wait_normal_min: f64,
+    pub avg_walk_min: f64,
     pub total_visits: usize,
     pub room_utilization: Vec<RoomUtilization>,
 }
@@ -54,6 +55,7 @@ impl Metrics {
             p90_wait_urgent_min: 0.0,
             avg_wait_normal_min: 0.0,
             p90_wait_normal_min: 0.0,
+            avg_walk_min: 0.0,
             total_visits: 0,
             room_utilization: Vec::new(),
         }
@@ -80,6 +82,11 @@ pub fn aggregate(patients: &[Patient], rooms: &[RoomUsage], now_min: f64) -> Met
         .flat_map(|patient| patient.visits.iter().map(|visit| visit.wait_min))
         .collect();
     let total_visits = waits.len();
+    let total_walks: Vec<f64> = patients
+        .iter()
+        .filter(|patient| patient.departed_at.is_some())
+        .map(|patient| patient.total_walk_min)
+        .collect();
 
     let waits_for = |priority: PatientPriority| -> Vec<f64> {
         patients
@@ -129,6 +136,7 @@ pub fn aggregate(patients: &[Patient], rooms: &[RoomUsage], now_min: f64) -> Met
         p90_wait_urgent_min: percentile_90(&urgent_waits),
         avg_wait_normal_min: mean(&normal_waits),
         p90_wait_normal_min: percentile_90(&normal_waits),
+        avg_walk_min: mean(&total_walks),
         total_visits,
         room_utilization,
     }
@@ -172,6 +180,8 @@ mod tests {
             done_rooms: Vec::new(),
             status: PatientStatus::Departed,
             current_room: None,
+            current_location: ENTRANCE_ID.into(),
+            total_walk_min: 0.0,
             enroute_since: None,
             queue_joined_at: None,
             departed_at: Some(30.0),
@@ -213,5 +223,15 @@ mod tests {
         assert!((metrics.avg_wait_normal_min - 15.0).abs() < 1e-9);
         assert!((metrics.p90_wait_normal_min - 20.0).abs() < 1e-9);
         assert!((metrics.avg_wait_min - 8.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn average_walk_time_is_reported_per_patient() {
+        let mut first = patient(PatientPriority::Normal, 1, &[1.0]);
+        first.total_walk_min = 4.0;
+        let mut second = patient(PatientPriority::Normal, 2, &[2.0]);
+        second.total_walk_min = 8.0;
+        let metrics = aggregate(&[first, second], &[], 30.0);
+        assert!((metrics.avg_walk_min - 6.0).abs() < 1e-9);
     }
 }

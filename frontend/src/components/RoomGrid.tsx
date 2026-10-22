@@ -74,6 +74,11 @@ export default function RoomGrid({ rooms }: RoomGridProps) {
                     <p className="mt-0.5 text-[11px] text-slate-400">
                       {room.capacity} parallel {room.capacity === 1 ? 'station' : 'stations'}
                     </p>
+                    {room.wing && (
+                      <span className="mt-1 inline-flex rounded-full border border-white/10 bg-black/25 px-2 py-0.5 text-[9px] font-medium uppercase tracking-[0.1em] text-slate-300">
+                        {room.wing}
+                      </span>
+                    )}
                   </div>
                   <div className="flex shrink-0 flex-col items-end gap-1">
                     {down && (

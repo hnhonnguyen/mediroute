@@ -76,3 +76,76 @@ cargo test 48/48 pass (code mới), 41/41 sau revert. Quy tắc vòng lặp: c�
 
 **Bài học:** coordination window 0.5 phút với reservations giúp tail (p90_total −4 phút) nhưng plan/recheck thêm chi phí routing làm phân tán patients khỏi lựa chọn cost-tối ưu cục bộ, tăng nhẹ avg. Nếu sau này thử lại hướng này, nên giới hạn coordination chỉ áp dụng khi contention thực sự cao (queue ≥ 2 ở ≥ 2 phòng eligible).
 
+---
+
+## Round 3 — Distance-aware routing (walk-time matrix)
+
+**Status:** ✅ COMMITTED (verified độc lập)
+
+**Aspect đề xuất:**
+1. Walk-time matrix theo khoảng cách vật lý:
+   - `walk_time(from, to) = 1.0 + 0.25 × euclidean(from, to)`, clamp `[1.0, 5.0]` phút
+   - Mỗi room có `position` + `wing`; entrance có vị trí riêng `(0, 0)`
+   - 3 wing thật: Lab (Blood Test, ECG), Imaging (X-Ray, Ultrasound), Consultation (Cardiology, Orthopedics, Endocrinology, ENT, Eye Exam)
+2. Patient có `current_location` (entrance lúc arrival, cập nhật thành room vừa hoàn tất) và `total_walk_min`
+3. SIM VẬT LÝ DÙNG CHUNG cho cả 3 strategies: `EnRoute` duration = `walk_time(current_location, room)` thay vì hằng số 2.0; predictive en-route load cũng dùng walk time thật
+4. Chỉ Optimized đổi routing: `cost(r) = est_wait(r) + est_service(r) + walk_time(current_location, r)`; FixedOrder vẫn thứ tự package, ShortestQueue vẫn chọn queue ngắn nhất — cả hai không đọc distance/wing
+5. Metrics additive: thêm `avg_walk_min` (tổng walk time trung bình mỗi patient hoàn tất), không bỏ field cũ
+6. UI additive: RoomGrid hiện badge wing; bảng so sánh ReportView thêm cột Avg walk; `types.ts` thêm field
+
+**Thiết kế & quyết định quan trọng:**
+- Layout: entrance `(0,0)` đặt cạnh Imaging wing; Lab và Consultation xa hơn. Cụ thể: Blood Test `(14, 9)`, ECG `(15.5, 9)`; X-Ray `(2.5, 2.5)`, Ultrasound `(4, 2.5)`; Cardiology `(6.5, 16.5)`, Orthopedics `(8, 16)`, Endocrinology `(9.5, 16.5)`, ENT `(7, 18)`, Eye Exam `(9, 18)`.
+  - Trong cùng wing: ~1.375–1.75 phút (`blood_test → ecg` = 1.375); khác wing: ~3.5–5.0 phút (`blood_test → cardiology` ≈ 4.5).
+- Optimized giữ nguyên cost dự đoán congestion, nhưng thêm walk time vào cost và mở tie band lên **25%** (`COST_TIE_BAND`, trước là 5%) với tie-break **walk gần nhất trước**, rồi mới tới unblocks/critical-path. Lý do: khi wait/service chênh lệch nhỏ trong band, chọn phòng gần giúp tour gọn wing thay vì nhảy wing vì lợi ích congestion rất nhỏ.
+  - Đã thử band 5% → 20% → 30% → 25%. Band 30% làm seed 123 thua ShortestQueue về p90_total (136.79 vs 126.75); 25% giữ Optimized tốt nhất avg_total + p90 trên cả 3 seed đồng thời hạ walk.
+- Baselines: routing logic giữ nguyên tuyệt đối (không đọc position/wing). Walk physics áp dụng cho mọi strategy nên avg_walk của baselines phản ánh package/queue order chứ không phải tối ưu khoảng cách.
+
+**Files changed:**
+- Backend: `domain.rs`, `scenario.rs`, `engine/{router,congestion,sim,stats}.rs`, `engine/learn.rs` (chỉ test fixture)
+- Frontend: `types.ts`, `components/RoomGrid.tsx`, `components/ReportView.tsx`, `App.tsx`
+- Docs: `README.md` (mô tả cost/wing/tests), `docs/rounds/README.md`
+
+**Kết quả compare (headless, cùng arrivals/packages/service samples):**
+
+Seed 42 (verify chuẩn):
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized** | **64.10** | **2.64** | **84.66** | **12.55** |
+| FixedOrder | 77.02 | 5.91 | 130.21 | 13.45 |
+| ShortestQueue | 71.32 | 4.33 | 103.89 | 13.57 |
+
+Seed 7:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized** | **72.26** | **4.25** | **128.48** | **12.55** |
+| FixedOrder | 84.39 | 7.08 | 138.89 | 13.82 |
+| ShortestQueue | 77.82 | 5.56 | 139.75 | 13.10 |
+
+Seed 123:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized** | **75.15** | **7.25** | **125.68** | **11.44** |
+| FixedOrder | 86.44 | 10.17 | 145.23 | 12.73 |
+| ShortestQueue | 81.09 | 8.67 | 126.75 | 12.49 |
+
+**Đánh giá tiêu chí verify:**
+- (a) Optimized tốt nhất cả avg_total và p90_total trên cả 3 seed.
+- (b) Optimized walk thấp nhất trên cả 3 seed: seed 42 −0.90/−1.02 phút, seed 7 −1.27/−0.55, seed 123 −1.29/−1.05 so với FixedOrder/ShortestQueue → router thực sự exploit distance.
+
+Live run seed 99 (fresh data dir, speed clamp 60): 52/52 patients, sim_time 405.47 phút, avg_total 80.45, avg_wait 7.16, p90_total 160.14, p90_wait 17.94, **avg_walk 11.49**, 188 visits.
+
+**Verify steps đã thực hiện:**
+1. `cargo test`: **50/50 pass** (41 test cũ + 9 test mới: walk_time clamp/growth, wing distances, Optimized chọn phòng gần khi cost tương đương, cost tính từ current room, baselines bỏ qua distance, EnRoute dùng walk time thật, patient location tracking, avg_walk metric).
+2. `npm run build`: OK (tsc + vite; chỉ còn warning chunk > 500 kB có từ trước).
+3. Fresh `MEDIROUTE_DATA_DIR=/tmp/mediroute-r3-test`, chạy isolated **PORT=8082**; live sim `{strategy: optimized, speed: 5000, seed: 99}` → chờ finished.
+4. `POST /api/sim/compare` seed 42, 7, 123; ghi đầy đủ avg_total/avg_wait/p90_total/avg_walk cho 3 strategies.
+5. Kiểm tra `/api/rooms` trả `wing` + `position`, `/api/status` trả `avg_walk_min`, frontend serve trên 8082.
+6. Không đụng port 8080 (process user pid 150786 vẫn nguyên); không git commit/push.
+
+
+**Verify độc lập (coordinator):** lặp lại quy trình chuẩn trên server riêng — cargo test 50/50, npm run build OK, fresh data dir → live seed 99 (finished, sim_time 405.5) → compare seeds 42/7/123: khớp chính xác từng số với report (64.10/2.64/84.66/12.55; 72.26/4.25/128.48/12.55; 75.15/7.25/125.68/11.44). Optimized tốt nhất avg_total + p90_total + avg_walk trên cả 3 seeds; gap với baselines nới rộng so với scenario Round 1 (seed 42: 7.2 min vs 5.0 min). 
+
+**Decision:** COMMIT — scenario vật lý thực hơn (walk 1–5 min theo khoảng cách thật giữa 3 khu) và router khai thác distance để nới rộng khoảng cách với cả 2 baselines trên mọi metric.

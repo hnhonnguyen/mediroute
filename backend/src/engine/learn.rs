@@ -159,6 +159,8 @@ mod tests {
             name: "Blood Test".into(),
             initial_avg_service_min: 10.0,
             capacity: 2,
+            wing: "test".into(),
+            position: (0.0, 0.0),
         }
     }
 

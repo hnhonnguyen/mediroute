@@ -33,6 +33,7 @@ const EMPTY_METRICS: Metrics = {
   in_hospital: 0,
   avg_total_min: 0,
   avg_wait_min: 0,
+  avg_walk_min: 0,
   p90_total_min: 0,
   p90_wait_min: 0,
   total_visits: 0,
@@ -104,7 +105,7 @@ function ScenarioCard({
     { label: 'Rooms', value: config.rooms.length },
     { label: 'Dependency rules', value: config.dependencies.length },
     { label: 'Packages', value: config.packages.length },
-    { label: 'Walk time', value: `${config.walk_time_min.toFixed(0)} min` },
+    { label: 'Walk time', value: '1-5 min by wing' },
   ];
   return (
     <section className="rounded-2xl border border-slate-800 bg-slate-900/40 p-4 shadow-xl shadow-black/20">

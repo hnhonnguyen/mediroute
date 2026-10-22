@@ -1,5 +1,3 @@
-use crate::domain::WALK_TIME_MIN;
-
 use super::router::RoomLoad;
 
 /// Everyone who will be served before a newly arriving patient.
@@ -36,8 +34,15 @@ pub fn est_wait_min(load: &RoomLoad, est_service_min: f64, capacity: usize) -> f
     }
 }
 
-pub fn route_cost(load: &RoomLoad, est_service_min: f64, capacity: usize) -> f64 {
-    est_wait_min(load, est_service_min, capacity) + est_service_min.max(0.0) + WALK_TIME_MIN
+pub fn route_cost(
+    load: &RoomLoad,
+    est_service_min: f64,
+    capacity: usize,
+    walk_min: f64,
+) -> f64 {
+    est_wait_min(load, est_service_min, capacity)
+        + est_service_min.max(0.0)
+        + walk_min.max(0.0)
 }
 
 fn projected_wait(
@@ -186,12 +191,12 @@ mod tests {
         // Stations 4. Zero free slots. Jobs: three queued + two en route = 5,
         // leaving the slot at 4 + 5 * 10 = 54.
         assert!((est_wait_min(&room, 10.0, 1) - 54.0).abs() < 1e-9);
-        assert!((route_cost(&room, 10.0, 1) - 66.0).abs() < 1e-9);
+        assert!((route_cost(&room, 10.0, 1, 2.0) - 66.0).abs() < 1e-9);
     }
 
     #[test]
     fn empty_room_cost_is_service_plus_walk() {
-        let cost = route_cost(&RoomLoad::default(), 12.0, 3);
+        let cost = route_cost(&RoomLoad::default(), 12.0, 3, 2.0);
         assert!((cost - 14.0).abs() < 1e-9);
     }
 }

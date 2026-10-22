@@ -19,61 +19,88 @@ pub const DOWNTIME_MAX_MIN: f64 = 20.0;
 /// Percentage of patients who receive expedited queue treatment.
 pub const URGENT_PATIENT_SHARE: f64 = 0.10;
 
+pub const LAB_WING: &str = "Lab wing";
+pub const IMAGING_WING: &str = "Imaging wing";
+pub const CONSULTATION_WING: &str = "Consultation wing";
+
 pub fn demo_scenario() -> Scenario {
+    // Wings are far apart on the hospital map; rooms inside a wing sit within
+    // ~2 distance units of each other. With walk_time = 1 + 0.25 * distance
+    // this yields 1-2 minute walks inside a wing and 3.5-5 minutes across
+    // wings. The entrance (0,0) opens next to the imaging wing, while the lab
+    // and consultation wings are the far destinations.
     let rooms = vec![
         Room {
             id: "blood_test".into(),
             name: "Blood Test".into(),
             initial_avg_service_min: 10.0,
             capacity: 3,
+            wing: LAB_WING.into(),
+            position: (14.0, 9.0),
         },
         Room {
             id: "xray".into(),
             name: "X-Ray".into(),
             initial_avg_service_min: 12.0,
             capacity: 2,
+            wing: IMAGING_WING.into(),
+            position: (2.5, 2.5),
         },
         Room {
             id: "ultrasound".into(),
             name: "Ultrasound".into(),
             initial_avg_service_min: 12.0,
             capacity: 2,
+            wing: IMAGING_WING.into(),
+            position: (4.0, 2.5),
         },
         Room {
             id: "ecg".into(),
             name: "ECG".into(),
             initial_avg_service_min: 8.0,
             capacity: 1,
+            wing: LAB_WING.into(),
+            position: (15.5, 9.0),
         },
         Room {
             id: "cardiology".into(),
             name: "Cardiology".into(),
             initial_avg_service_min: 15.0,
             capacity: 1,
+            wing: CONSULTATION_WING.into(),
+            position: (6.5, 16.5),
         },
         Room {
             id: "orthopedics".into(),
             name: "Orthopedics".into(),
             initial_avg_service_min: 12.0,
             capacity: 1,
+            wing: CONSULTATION_WING.into(),
+            position: (8.0, 16.0),
         },
         Room {
             id: "endocrinology".into(),
             name: "Endocrinology".into(),
             initial_avg_service_min: 10.0,
             capacity: 1,
+            wing: CONSULTATION_WING.into(),
+            position: (9.5, 16.5),
         },
         Room {
             id: "ent".into(),
             name: "ENT".into(),
             initial_avg_service_min: 8.0,
             capacity: 1,
+            wing: CONSULTATION_WING.into(),
+            position: (7.0, 18.0),
         },
         Room {
             id: "eye_exam".into(),
             name: "Eye Exam".into(),
             initial_avg_service_min: 8.0,
             capacity: 2,
+            wing: CONSULTATION_WING.into(),
+            position: (9.0, 18.0),
         },
     ];
 
@@ -177,5 +204,36 @@ mod tests {
                 assert!(from < to, "{} must precede {}", edge.from, edge.to);
             }
         }
+    }
+
+    #[test]
+    fn same_wing_rooms_are_near_and_cross_wing_rooms_are_far() {
+        let scenario = demo_scenario();
+        for from in &scenario.rooms {
+            assert!(!from.wing.is_empty(), "{} needs a wing", from.id);
+            for to in &scenario.rooms {
+                if from.id == to.id {
+                    continue;
+                }
+                let walk = scenario.walk_time_between(&from.id, &to.id);
+                if from.wing == to.wing {
+                    assert!(
+                        (1.0..=2.0).contains(&walk),
+                        "{} -> {} same wing should be 1-2 min, was {walk}",
+                        from.id,
+                        to.id
+                    );
+                } else {
+                    assert!(
+                        (3.0..=5.0).contains(&walk),
+                        "{} -> {} across wings should be 3-5 min, was {walk}",
+                        from.id,
+                        to.id
+                    );
+                }
+            }
+        }
+        assert!((scenario.walk_time_between("blood_test", "ecg") - 1.375).abs() < 1e-9);
+        assert!(scenario.walk_time_between("blood_test", "ecg") < scenario.walk_time_between("blood_test", "cardiology"));
     }
 }

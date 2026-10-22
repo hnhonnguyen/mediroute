@@ -7,8 +7,8 @@ use rand::{Rng, SeedableRng};
 use serde::Serialize;
 
 use crate::domain::{
-    DependencyGraph, Package, Patient, PatientPriority, PatientStatus, Room, RoomStats, Scenario,
-    VisitRecord, WALK_TIME_MIN,
+    walk_time, DependencyGraph, Package, Patient, PatientPriority, PatientStatus, Room, RoomStats,
+    Scenario, VisitRecord, ENTRANCE_ID, ENTRANCE_POSITION, WALK_TIME_MIN,
 };
 use crate::scenario::{
     DEFAULT_ARRIVAL_WINDOW_MIN, DOWNTIME_MAX_MIN, DOWNTIME_MIN_MIN,
@@ -40,6 +40,8 @@ pub struct RoomView {
     pub id: String,
     pub name: String,
     pub capacity: usize,
+    pub wing: String,
+    pub position: (f64, f64),
     pub initial_avg_service_min: f64,
     pub est_service_min: f64,
     pub est_wait_observed_avg: f64,
@@ -64,6 +66,8 @@ impl RoomView {
                     id: room.id.clone(),
                     name: room.name.clone(),
                     capacity: room.capacity,
+                    wing: room.wing.clone(),
+                    position: room.position,
                     initial_avg_service_min: room.initial_avg_service_min,
                     est_service_min: learned
                         .map(|stats| stats.est_service_min)
@@ -252,6 +256,8 @@ impl World {
                 done_rooms: Vec::new(),
                 status: PatientStatus::Arrived,
                 current_room: None,
+                current_location: ENTRANCE_ID.into(),
+                total_walk_min: 0.0,
                 enroute_since: None,
                 queue_joined_at: None,
                 departed_at: None,
@@ -402,6 +408,8 @@ impl World {
                     id: room.id.clone(),
                     name: room.name.clone(),
                     capacity: room.capacity,
+                    wing: room.wing.clone(),
+                    position: room.position,
                     initial_avg_service_min: room.initial_avg_service_min,
                     est_service_min: est_service,
                     est_wait_observed_avg: learned
@@ -566,10 +574,11 @@ impl World {
                 };
                 {
                     let patient_state = &mut self.patients[patient];
-                    patient_state.done_rooms.push(room_id);
+                    patient_state.done_rooms.push(room_id.clone());
                     patient_state.visits.push(record.clone());
                     patient_state.status = PatientStatus::Arrived;
                     patient_state.current_room = None;
+                    patient_state.current_location = room_id;
                     patient_state.enroute_since = None;
                     patient_state.queue_joined_at = None;
                 }
@@ -664,18 +673,38 @@ impl World {
         }
     }
 
+    fn walk_time_between(&self, from: &str, to: &str) -> f64 {
+        let position = |location: &str| {
+            if location == ENTRANCE_ID {
+                Some(ENTRANCE_POSITION)
+            } else {
+                self.scenario_rooms
+                    .iter()
+                    .find(|room| room.id == location)
+                    .map(|room| room.position)
+            }
+        };
+        match (position(from), position(to)) {
+            (Some(from), Some(to)) => walk_time(from, to),
+            _ => WALK_TIME_MIN,
+        }
+    }
+
     fn assign_room(&mut self, patient: usize, room_id: String) {
         let Some(room) = self.room_index.get(&room_id).copied() else {
             return;
         };
+        let from = self.patients[patient].current_location.clone();
+        let walk_min = self.walk_time_between(&from, &room_id);
         {
             let state = &mut self.patients[patient];
             state.status = PatientStatus::EnRoute;
             state.current_room = Some(room_id);
             state.enroute_since = Some(self.now);
+            state.total_walk_min += walk_min;
         }
         self.schedule(
-            self.now + WALK_TIME_MIN,
+            self.now + walk_min,
             Event::QueueJoin { patient, room },
         );
     }
@@ -688,6 +717,7 @@ impl World {
             graph: &self.graph,
             stats: self.learner.stats(),
             loads: &loads,
+            current_location: &patient.current_location,
         };
         context.next_room(self.strategy, &patient.required_rooms, &patient.done_rooms)
     }
@@ -768,7 +798,12 @@ impl World {
                     };
                     let walk_left = patient
                         .enroute_since
-                        .map(|since| (since + WALK_TIME_MIN - self.now).max(0.0))
+                        .map(|since| {
+                            (since
+                                + self.walk_time_between(&patient.current_location, room_id)
+                                - self.now)
+                                .max(0.0)
+                        })
                         .unwrap_or(0.0);
                     let est_service = self.estimated_service(room_id);
                     let load = loads.get(room_id).cloned().unwrap_or_default();
@@ -955,6 +990,8 @@ mod tests {
                 name: "Only Room".into(),
                 initial_avg_service_min: 5.0,
                 capacity: 1,
+                wing: "test".into(),
+                position: (0.0, 0.0),
             }],
             dependencies: Vec::new(),
             packages: vec![Package {
@@ -1119,5 +1156,62 @@ mod tests {
         world.handle_event(Event::RoomDowntimeEnd { room: 0 });
         assert!(world.rooms[0].queue.is_empty());
         assert_eq!(world.rooms[0].pending_starts, 1);
+    }
+
+    #[test]
+    fn en_route_uses_distance_based_walk_time() {
+        let scenario = demo_scenario();
+        let mut world = demo_world(Strategy::Optimized, 42, 1);
+        world.events.clear();
+        world.patients[0].current_location = "blood_test".into();
+        let started_at = world.now;
+        world.assign_room(0, "ecg".into());
+
+        let expected = scenario.walk_time_between("blood_test", "ecg");
+        let cardiology = scenario.walk_time_between("blood_test", "cardiology");
+        assert!(expected < cardiology, "same-wing ECG should be closer than Cardiology");
+        let join_at = world
+            .events
+            .iter()
+            .find_map(|event| match &event.event {
+                Event::QueueJoin { patient: 0, .. } => Some(event.at),
+                _ => None,
+            })
+            .expect("queue join was scheduled");
+        assert!(
+            (join_at - (started_at + expected)).abs() < 1e-9,
+            "queue join at {join_at}, expected walk {expected}"
+        );
+        assert!((world.patients[0].total_walk_min - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn patient_location_starts_at_entrance_and_tracks_completed_rooms() {
+        let mut world = demo_world(Strategy::Optimized, 5, 2);
+        assert_eq!(world.patients[0].current_location, ENTRANCE_ID);
+
+        world.rooms[0].in_service.push(InService {
+            patient: 0,
+            started_at: 0.0,
+            ends_at: 0.0,
+        });
+        let room_id = world.scenario_rooms[0].id.clone();
+        world.handle_event(Event::ServiceEnd { patient: 0, room: 0 });
+        assert_eq!(world.patients[0].current_location, room_id);
+    }
+
+    #[test]
+    fn metrics_report_average_patient_walk_time() {
+        let mut world = demo_world(Strategy::Optimized, 42, DEFAULT_PATIENT_COUNT);
+        world.run_to_completion();
+        let metrics = world.metrics();
+        assert!(metrics.avg_walk_min > 0.0);
+        let manual = world
+            .patients
+            .iter()
+            .map(|patient| patient.total_walk_min)
+            .sum::<f64>()
+            / world.patients.len() as f64;
+        assert!((metrics.avg_walk_min - manual).abs() < 1e-9);
     }
 }

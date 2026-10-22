@@ -82,10 +82,13 @@ When a patient arrives or finishes a checkup:
 3. **Anti-herding lookahead**: patients who are about to finish elsewhere and are eligible for the
    same room are added as weighted, expected competitors, so many patients do not all pile into the
    room that looks empty right now.
-4. **Cost**: `est_wait + est_service + walk_time` (walk time is 2 minutes).
-5. **Choice**: lowest cost. Costs within 5% are treated as ties; ties prefer the room that unblocks
-   more dependent rooms, then the longest downstream dependency chain, then fewer en-route
-   patients, shorter queue, and earlier package position.
+4. **Cost**: `est_wait + est_service + walk_time(current_location, room)`. Walking time comes from
+   the room map: one minute plus 0.25 minutes per euclidean distance unit, clamped to 1-5 minutes.
+   Rooms in the same wing are 1-2 minutes apart; cross-wing trips take 3.5-5 minutes. A patient's
+   location starts at the entrance and becomes the room they most recently finished.
+5. **Choice**: lowest cost. Costs within 25% are treated as ties; ties prefer the closest room,
+   then the room that unblocks more dependent rooms, then the longest downstream dependency chain,
+   then fewer en-route patients, shorter queue, and earlier package position.
 
 `FixedOrder` and `ShortestQueue` intentionally keep their original, congestion-blind behavior so
 the comparison stays fair.
@@ -100,8 +103,10 @@ Strategies:
 
 ## Demo scenario
 
-Nine rooms: Blood Test (capacity 3), X-Ray (2), Ultrasound (2), ECG (1), Cardiology (1),
-Orthopedics (1), Endocrinology (1), ENT (1), Eye Exam (2).
+Nine rooms grouped into three wings: Lab wing (Blood Test, capacity 3; ECG, 1), Imaging wing
+(X-Ray, 2; Ultrasound, 2), and Consultation wing (Cardiology, Orthopedics, Endocrinology, ENT, all
+capacity 1; Eye Exam, 2). The entrance sits next to the imaging wing; rooms inside a wing are 1-2
+minutes apart and cross-wing walks are 3.5-5 minutes.
 
 Dependencies: Blood Test → Endocrinology, Blood Test → Cardiology, X-Ray → Orthopedics,
 ECG → Cardiology. A dependency applies only when both rooms are in the patient's package.
@@ -148,12 +153,14 @@ cd backend && cargo test
 cd frontend && npm run build
 ```
 
-The backend suite (41 tests) covers DAG validation and cycle detection, dependency-aware
-eligibility, predictive station-free waits, anti-herding and en-route-aware routing, the 5% cost
-band and longest-chain tie-break, the learned-vs-seed estimate, EWMA convergence, persistence
+The backend suite (50 tests) covers DAG validation and cycle detection, dependency-aware
+eligibility, predictive station-free waits, anti-herding and en-route-aware routing, the cost band
+and longest-chain tie-break, the learned-vs-seed estimate, EWMA convergence, persistence
 round-trips, seeded determinism, all-patients-depart completion, single-room packages, rush-hour
 bursts, urgent FIFO priority, downtime holding queues while in-service visits finish, urgent/normal
-wait metrics, and Optimized beating Fixed Order on a fixed seed.
+wait metrics, distance-based walk times and their clamps, wing layout, distance-aware Optimized
+routing, distance-blind baselines, per-patient walk tracking, and Optimized beating Fixed Order on
+a fixed seed.
 
 ## Project layout
 

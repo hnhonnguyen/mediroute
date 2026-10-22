@@ -3,9 +3,14 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{DependencyGraph, Room, RoomStats};
+use crate::domain::{walk_time, DependencyGraph, Room, RoomStats, ENTRANCE_ID, ENTRANCE_POSITION, WALK_TIME_MIN};
 
 use super::congestion;
+
+/// Costs within this relative band count as ties. Round 3 widens the band from
+/// 5% to 25% so the distance tie-break can act on moderately congested rooms,
+/// not only on near-identical estimates.
+const COST_TIE_BAND: f64 = 0.25;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,6 +69,8 @@ pub struct RouteContext<'a> {
     pub graph: &'a DependencyGraph,
     pub stats: &'a HashMap<String, RoomStats>,
     pub loads: &'a HashMap<String, RoomLoad>,
+    /// Physical location the patient is leaving: `ENTRANCE_ID` or a room id.
+    pub current_location: &'a str,
 }
 
 impl RouteContext<'_> {
@@ -144,6 +151,23 @@ impl RouteContext<'_> {
             .unwrap_or(1)
     }
 
+    fn position(&self, location: &str) -> Option<(f64, f64)> {
+        if location == ENTRANCE_ID {
+            return Some(ENTRANCE_POSITION);
+        }
+        self.rooms
+            .iter()
+            .find(|candidate| candidate.id == location)
+            .map(|candidate| candidate.position)
+    }
+
+    fn walk_to(&self, room: &str) -> f64 {
+        match (self.position(self.current_location), self.position(room)) {
+            (Some(from), Some(to)) => walk_time(from, to),
+            _ => WALK_TIME_MIN,
+        }
+    }
+
     fn unblocks(&self, room: &str, required: &HashSet<&str>, done: &HashSet<&str>) -> usize {
         self.graph
             .dependents(room)
@@ -196,20 +220,31 @@ impl RouteContext<'_> {
         done: &HashSet<&str>,
     ) -> Ordering {
         // `min_by` expects Ordering::Less for the preferred room. Costs within
-        // 5% count as a tie so the critical-path tie-breaks can act; clear
-        // cost differences still win outright.
+        // the tie band are resolved by distance and then critical-path rules;
+        // clear cost differences still win outright.
+        let walk_a = self.walk_to(room_a);
+        let walk_b = self.walk_to(room_b);
         let cost_a = congestion::route_cost(
             &self.load(room_a),
             self.est_service(room_a),
             self.capacity(room_a),
+            walk_a,
         );
         let cost_b = congestion::route_cost(
             &self.load(room_b),
             self.est_service(room_b),
             self.capacity(room_b),
+            walk_b,
         );
-        if !costs_within_percent(cost_a, cost_b, 0.05) {
+        if !costs_within_percent(cost_a, cost_b, COST_TIE_BAND) {
             return cost_a.total_cmp(&cost_b);
+        }
+
+        // Near-ties break on walking distance first, keeping the tour inside
+        // one wing when congestion is comparable.
+        let walk_order = walk_a.total_cmp(&walk_b);
+        if walk_order != Ordering::Equal {
+            return walk_order;
         }
 
         let unblocks_a = self.unblocks(room_a, required, done);
@@ -253,11 +288,17 @@ mod tests {
     use crate::domain::{DependencyEdge, Room};
 
     fn room(id: &str, seed: f64, capacity: usize) -> Room {
+        room_at(id, seed, capacity, (0.0, 0.0))
+    }
+
+    fn room_at(id: &str, seed: f64, capacity: usize, position: (f64, f64)) -> Room {
         Room {
             id: id.to_string(),
             name: id.to_string(),
             initial_avg_service_min: seed,
             capacity,
+            wing: "test".into(),
+            position,
         }
     }
 
@@ -328,6 +369,7 @@ mod tests {
             graph: &graph,
             stats: &stats,
             loads: &loads,
+            current_location: ENTRANCE_ID,
         };
         let required = vec!["blood".into(), "endo".into()];
 
@@ -352,6 +394,7 @@ mod tests {
             graph: &graph,
             stats: &stats,
             loads: &loads,
+            current_location: ENTRANCE_ID,
         };
         let required = vec!["a".into(), "b".into()];
         assert_eq!(
@@ -373,6 +416,7 @@ mod tests {
             graph: &graph,
             stats: &stats,
             loads: &loads,
+            current_location: ENTRANCE_ID,
         };
         let required = vec!["a".into(), "b".into()];
         assert_eq!(
@@ -393,6 +437,7 @@ mod tests {
             graph: &graph,
             stats: &stats,
             loads: &loads,
+            current_location: ENTRANCE_ID,
         };
         let required = vec!["a".into(), "b".into()];
         assert_eq!(
@@ -412,6 +457,7 @@ mod tests {
             graph: &graph,
             stats: &stats,
             loads: &loads,
+            current_location: ENTRANCE_ID,
         };
         let required = vec!["a".into(), "b".into()];
         assert_eq!(
@@ -435,6 +481,7 @@ mod tests {
             graph: &graph,
             stats: &stats,
             loads: &loads,
+            current_location: ENTRANCE_ID,
         };
         let required = vec!["a".into(), "b".into(), "c".into()];
         assert_eq!(
@@ -454,6 +501,7 @@ mod tests {
             graph: &graph,
             stats: &stats,
             loads: &loads,
+            current_location: ENTRANCE_ID,
         };
 
         // Endocrinology alone is fine: the blood-test edge is not relevant.
@@ -489,6 +537,7 @@ mod tests {
             graph: &graph,
             stats: &stats,
             loads: &loads,
+            current_location: ENTRANCE_ID,
         };
         let required = vec!["a".into(), "b".into()];
         assert_eq!(
@@ -516,6 +565,7 @@ mod tests {
             graph: &graph,
             stats: &stats,
             loads: &loads,
+            current_location: ENTRANCE_ID,
         };
         let required = vec![
             "b".to_string(),
@@ -546,12 +596,93 @@ mod tests {
             graph: &graph,
             stats: &stats,
             loads: &loads,
+            current_location: ENTRANCE_ID,
         };
         // a is listed first and has the deeper chain, but b is clearly cheaper.
         let required = vec!["a".into(), "b".into(), "c".into(), "d".into()];
         assert_eq!(
             ctx.next_room(Strategy::Optimized, &required, &[]),
             Some("b".to_string())
+        );
+    }
+
+    #[test]
+    fn optimized_prefers_the_nearer_room_when_wait_and_service_match() {
+        let rooms = vec![
+            room_at("far", 10.0, 1, (20.0, 20.0)),
+            room_at("near", 10.0, 1, (3.0, 0.0)),
+        ];
+        let graph = graph(&rooms, &[]);
+        let stats = stats(&rooms, &[]);
+        let loads = HashMap::new();
+        let ctx = RouteContext {
+            rooms: &rooms,
+            graph: &graph,
+            stats: &stats,
+            loads: &loads,
+            current_location: ENTRANCE_ID,
+        };
+        // Same wait and service; the far room is listed first.
+        let required = vec!["far".into(), "near".into()];
+        assert_eq!(
+            ctx.next_room(Strategy::Optimized, &required, &[]),
+            Some("near".to_string())
+        );
+    }
+
+    #[test]
+    fn optimized_walk_cost_starts_from_patients_current_room() {
+        // The patient is at "west" (6,0). Candidate "next_here" (8,0) is close
+        // to them; candidate "near_entrance" (0,6) is closer to the entrance
+        // but far from the patient.
+        let rooms = vec![
+            room_at("west", 10.0, 1, (6.0, 0.0)),
+            room_at("next_here", 10.0, 1, (8.0, 0.0)),
+            room_at("near_entrance", 10.0, 1, (0.0, 6.0)),
+        ];
+        let graph = graph(&rooms, &[]);
+        let stats = stats(&rooms, &[]);
+        let loads = HashMap::new();
+        let ctx = RouteContext {
+            rooms: &rooms,
+            graph: &graph,
+            stats: &stats,
+            loads: &loads,
+            current_location: "west",
+        };
+        let required = vec!["near_entrance".into(), "next_here".into()];
+        assert_eq!(
+            ctx.next_room(Strategy::Optimized, &required, &[]),
+            Some("next_here".to_string())
+        );
+    }
+
+    #[test]
+    fn baselines_ignore_walk_distance() {
+        let rooms = vec![
+            room_at("far", 10.0, 1, (20.0, 20.0)),
+            room_at("near", 10.0, 1, (3.0, 0.0)),
+        ];
+        let graph = graph(&rooms, &[]);
+        let stats = stats(&rooms, &[]);
+        // The near room has a queue; the far room is empty. ShortestQueue must
+        // still pick the far room because it never looks at distance.
+        let loads = loads(&[("far", 0, 0, 0, 0), ("near", 3, 0, 0, 0)]);
+        let ctx = RouteContext {
+            rooms: &rooms,
+            graph: &graph,
+            stats: &stats,
+            loads: &loads,
+            current_location: ENTRANCE_ID,
+        };
+        let required = vec!["far".into(), "near".into()];
+        assert_eq!(
+            ctx.next_room(Strategy::FixedOrder, &required, &[]),
+            Some("far".to_string())
+        );
+        assert_eq!(
+            ctx.next_room(Strategy::ShortestQueue, &required, &[]),
+            Some("far".to_string())
         );
     }
 }
