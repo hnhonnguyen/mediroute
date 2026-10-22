@@ -1706,3 +1706,100 @@ h = walk(now → room) + wait_at(room)     // horizon tới lúc bệnh nhân d�
 **Verify độc lập (coordinator):** `cargo test` 87/87 pass; server riêng PORT=8082, fresh `/tmp/mediroute-r17-verify`, live seed 99 speed 5000, compare seeds 42/7/123/5/2024 — Optimized: s42 65.10/78.41, s7 73.65/128.20, s123 73.26/116.37, s5 117.50/211.63, s2024 70.00/115.30 (avg_total/p90_total) — khớp report agent. Mean avg 79.90 (+0.914% vs R16), mean p90 129.98 (−2.55%). Optimized #1 10/10 ô. Baselines khớp R16 từng số.
 
 **Bài học:** (1) Over-prediction có hệ thống trong first-step wait (walk bị tính hai lần: một trong cost, một trong wait-at-now) đo được bằng instrumentation trước khi sửa — đo trước, sửa sau, và chỉ chấp nhận estimator mới khi nó *giảm* bias trên chính dữ liệu đo. (2) Demand-aware wait tại ETA calibration tốt trong lull nhưng over-price cuối rush → min-cap là cơ chế đúng (không bao giờ để dự đoán mới làm tăng cost). (3) Cửa sổ `[100,150)` (peak-edge + lull) là biến thể duy nhất trong 10 sweep vừa đạt mean p90 vừa giữ avg trong ngưỡng — sweep biến thể với cùng protocol là cách chọn thiết kế khi có nhiều lựa chọn khả dĩ.
+
+## Round 18 — Secondary-peak anticipation
+
+**Status:** ❌ DISCARD — giả thuyết under-prediction bị bác bỏ bởi đo lường: bias dương (over-prediction) ở **5/5 seeds, 3/3 sub-windows**; `wait_at` chỉ under-predict 5/263 quyết định. Không thay đổi code routing/congestion; working tree chỉ thêm section docs này.
+
+**Aspect đề xuất:**
+- R17 vừa sửa first-step wait trong cửa sổ post-peak `[100,150)` bằng **min-cap** `min(wait_at, demand_wait@ETA)`, vì đo được demand@ETA over-price các phút cuối rush sơ cấp. Phía đối diện chưa thử: khi ETA của first step rơi vào trước/trong rush phụ `[150,210)`, arrivals mới đang xây lại hàng đợi, nên `demand_wait@ETA` có thể **lớn hơn** `wait_at`; nếu đúng, `wait_at` đang under-price congestion tăng và patient được route vào phòng "rảnh bây giờ" rồi tới nơi thì queue đã dài.
+- Đề xuất (nếu có tín hiệu): asymmetric **max-cap** `max(wait_at, demand_wait@ETA)` trong cửa sổ ETA `[135,210)`, không phá min-cap `[100,150)` của R17.
+
+**Instrumentation (tạm trong `sim.rs`, đã revert hoàn toàn):**
+- Trong `World::next_room`, ghi lại mỗi quyết định: `now`, `walk`, `wait_at` (đúng base của `first_step_wait`, gồm nhánh downtime), `demand_wait@ETA = future_wait_min(..., now, walk)`, và predictor R17 (min-cap khi `now ∈ [100,150)` và không downtime, ngược lại `wait_at`).
+- Actual wait lấy từ `VisitRecord.wait_min` của đúng cặp (patient, room); mỗi bệnh nhân visit mỗi room một lần nên khớp 1-1.
+- Stats snapshot lấy từ live seed 99 (protocol chuẩn: fresh learner → live optimized seed 99 → `Learner::from_stats`) rồi chạy headless Optimized cho 5 seeds. Cửa sổ quyết định theo **ETA = now + walk** ∈ `[135,210)`, chia `[135,150)`, `[150,180)`, `[180,210)`. Bias = pred − actual (dương = over-predict).
+- Toàn bộ probe dùng `#[cfg(test)]` + field tạm, đã gỡ; `git diff` trước khi viết docs rỗng.
+
+**Đo bias theo seed (ETA ∈ [135,210), đơn vị phút):**
+
+| Seed | n | Actual TB | `wait_at` bias / MAE | `demand@ETA` bias / MAE | R17 bias / MAE | max-cap bias / MAE |
+|---|---|---|---|---|---|---|
+| 42 | 65 | 4.27 | **+6.12** / 6.69 | +3.43 / 3.93 | +5.98 / 6.59 | +6.79 / 7.25 |
+| 7 | 47 | 5.02 | **+3.58** / 3.58 | +2.32 / 2.44 | +1.87 / 1.99 | +4.75 / 4.75 |
+| 123 | 43 | 10.92 | **+9.66** / 10.04 | +3.84 / 4.13 | +7.76 / 8.13 | +10.56 / 10.86 |
+| 5 | 51 | 22.62 | **+12.00** / 12.15 | +2.10 / 6.23 | +9.15 / 11.33 | +12.53 / 12.68 |
+| 2024 | 57 | 6.74 | **+7.19** / 7.54 | +4.08 / 4.51 | +5.28 / 5.78 | +8.41 / 8.69 |
+| Mean 5 seeds | 263 | — | **+7.71 / 8.00** | +3.15 / 4.25 | +6.01 / 6.76 | +8.60 / 8.85 |
+
+- Tần suất cơ chế giả thuyết: `demand@ETA > wait_at` ở **122/263** quyết định (46.4%) — cơ chế "hàng đợi tăng theo ETA" có thật, chủ yếu ở `[150,180)` (52/95 = 54.7%) và `[180,210)` (67/127 = 52.8%).
+- Nhưng so với actual: `wait_at < actual` chỉ **5/263** (1.9%); `demand@ETA < actual` chỉ **13/263** (4.9%). Tức cả hai estimator đều over-predict; max-cap chọn ước lượng lớn hơn nên càng over-price.
+
+**Đo bias theo sub-window (trung bình 5 seeds):**
+
+| Sub-window | n | Actual TB | `wait_at` bias / MAE | `demand@ETA` bias / MAE | R17 bias / MAE | max-cap bias / MAE | `dem>at` |
+|---|---|---|---|---|---|---|---|
+| `[135,150)` | 41 | 14.14 | **+10.81 / 10.81** | +1.88 / 4.06 | +1.86 / 4.04 | +11.16 / 11.16 | 3/41 |
+| `[150,180)` | 95 | 7.58 | **+5.06 / 5.63** | +2.91 / 4.21 | +4.64 / 5.21 | +5.88 / 6.34 | 52/95 |
+| `[180,210)` | 127 | 10.48 | **+8.76 / 8.90** | +3.73 / 3.97 | +8.76 / 8.90 | +9.87 / 9.98 | 67/127 |
+
+**Chia theo thời điểm quyết định** (mean 5 seeds, bias / MAE):
+
+| Nhóm | n | `wait_at` | `demand@ETA` | R17 | max-cap | `wait_at < actual` |
+|---|---|---|---|---|---|---|
+| decided `now < 150` (R17 min-cap active) | 47 | +9.94 / 10.34 | +1.61 / 3.82 | **+1.54 / 3.84** | +10.29 / 10.60 | 2/47 |
+| decided `now ≥ 150` (trong rush phụ) | 216 | **+7.22 / 7.47** | +3.59 / 4.34 | = `wait_at` | +8.24 / 8.45 | 3/216 |
+
+**Diễn giải — vì sao không có tín hiệu under-pricing:**
+- Cơ chế đối xứng của R17 có tồn tại nhưng **không đủ mạnh để tạo under-prediction thực**: trung bình `demand@ETA − wait_at = −4.56` phút trên toàn cửa sổ (chỉ seed 7 sub-window `[180,210)` dương nhẹ +0.91). Khi demand@ETA lớn hơn wait_at thì chênh lệch nhỏ; khi nhỏ hơn thì chênh lệch lớn (walk-time drain + demand model over-estimate arrivals theo room share).
+- Lý do vật lý: `wait_at` đã bao gồm thời gian drain trong lúc đi bộ, và các phòng Optimized chọn thường đang thoát tải; actual wait trung bình 4–23 phút nhưng thấp hơn dự báo ở 98% quyết định. Trong rush phụ, `demand@ETA` cũng vẫn over-predict actual (+3.59 ở nhóm decided `now ≥ 150`), nên "giá theo ETA" không phải là giá đúng.
+- Vì vậy **max-cap không được triển khai**: nó làm bias/MAE tệ hơn `wait_at` ở 5/5 seeds và 3/3 sub-windows (mean MAE 8.85 vs 8.00), tức sẽ chủ động inflate cost.
+- Quan sát phụ (ngoài phạm vi round, chưa benchmark): R17 min-cap cải thiện calibration rõ ở nhóm `now < 150` (bias +1.54 vs +9.94 của wait_at). Demand@ETA cũng calibrated hơn wait_at trong rush phụ (MAE 4.25 vs 8.00). Điều này gợi ý hướng **mở rộng min-cap** sang rush phụ — nhưng đó là can thiệp ngược chiều với giả thuyết rising-demand pricing của round này và chưa được kiểm chứng, nên không thực hiện.
+
+**Variant sweep:** **Không chạy** — theo methodology, sweep chỉ thực hiện nếu bias âm có hệ thống. Đo được bias dương ở mọi seed/sub-window nên round dừng trước bước thiết kế pricing; không ép buộc improvement.
+
+**Compare 5 seeds** (fresh `/tmp/mediroute-r18-test`, `PORT=8082`, live seed 99 speed 5000 → compare 42/7/123/5/2024, trên **final tree sau khi revert**):
+
+| Seed | Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|---|
+| 42 | **Optimized** | **65.0999** | **3.1666** | **78.4098** | **11.6167** |
+| 42 | Fixed Order | 77.0249 | 5.9134 | 130.2068 | 13.4523 |
+| 42 | Shortest Queue | 71.3185 | 4.3273 | 103.8948 | 13.5720 |
+| 7 | **Optimized** | **73.6461** | **4.8477** | **128.1961** | **11.6399** |
+| 7 | Fixed Order | 84.3898 | 7.0846 | 138.8932 | 13.8233 |
+| 7 | Shortest Queue | 77.8194 | 5.5577 | 139.7541 | 13.0962 |
+| 123 | **Optimized** | **73.2556** | **6.8929** | **116.3665** | **10.7541** |
+| 123 | Fixed Order | 86.4409 | 10.1679 | 145.2265 | 12.7288 |
+| 123 | Shortest Queue | 81.0868 | 8.6726 | 126.7505 | 12.4931 |
+| 5 | **Optimized** | **117.5001** | **16.9063** | **211.6310** | **11.5661** |
+| 5 | Fixed Order | 124.1452 | 18.3369 | 240.2734 | 12.9288 |
+| 5 | Shortest Queue | 119.3817 | 16.9931 | 246.6130 | 13.1272 |
+| 2024 | **Optimized** | **70.0024** | **4.0933** | **115.3030** | **11.6839** |
+| 2024 | Fixed Order | 79.4512 | 6.0142 | 144.2094 | 13.8921 |
+| 2024 | Shortest Queue | 74.2294 | 4.8259 | 124.3680 | 13.1494 |
+
+- Mean 5 seeds (Optimized): avg_total **79.9008**, avg_wait 7.1814, p90_total **129.9813**, avg_walk 11.4521; FixedOrder 90.2904 / 9.5034 / 159.7619 / 13.3650; ShortestQueue 84.7672 / 8.0753 / 148.2761 / 13.0876.
+- Toàn bộ 15 ô × 4 metric **bit-identical R17**, kể cả live seed 99: finished `t = 408.14508086711777`, 52/52, 188 visits, 83.4505 / 8.0682 / 157.1367 / 20.5701 / 11.1977. Xác nhận final tree không thay đổi hành vi.
+
+**Đánh giá theo tiêu chí:**
+- **(a) Mean p90_total tốt hơn R17: ❌ KHÔNG ĐẠT** — giữ nguyên 129.9813 (không có thay đổi).
+- **(b) Mean avg_total không tệ hơn 1%: ✅ ĐẠT** — 79.9008, Δ = 0.
+- **(c) Optimized #1 mọi seed mọi metric chính: ✅ ĐẠT 10/10 ô** — giữ nguyên như R17.
+- Round không tạo ra candidate thay đổi nên (a) không thể đạt; đây là kết quả âm hợp lệ theo protocol, không phải regression.
+
+**Tests:**
+- `cargo test`: **87/87 pass** trước và sau khi gỡ instrumentation. Không thêm test mới vì không có logic production nào thay đổi; probe đo lường là `#[cfg(test)]` tạm thời và đã revert hoàn toàn.
+- `git diff` cuối cùng chỉ chứa `docs/rounds/README.md`; `backend/src/engine/sim.rs` trở về đúng HEAD.
+
+**Files changed:** `docs/rounds/README.md` (section này). Không đổi `router.rs`, `congestion.rs`, `sim.rs`, `api.rs`, `main.rs`, `domain.rs`, `scenario.rs`, `stats.rs`, `learn.rs`, frontend, baselines, serving/FIFO, priority, downtime, learning, API/JSON.
+
+**Verify steps:**
+1. `cd backend && ~/.local/bin/cargo test` → 87/87 pass (baseline trước khi instrument và sau khi revert).
+2. Baseline tại HEAD: fresh `MEDIROUTE_DATA_DIR=/tmp/mediroute-r18-test`, server riêng `PORT=8082` (không đụng 8080), live `{strategy:optimized, speed:5000, seed:99}` → 408.1451 phút, 52/52, 188 visits, metrics như trên; compare 42/7/123/5/2024 khớp R17 từng số.
+3. Instrumentation tạm trong `sim.rs` (probe `wait_at` / `demand@ETA` / R17 / max-cap vs actual wait theo cặp patient-room), chạy 5 seeds với stats snapshot từ live seed 99; thu bảng bias ở trên; gỡ instrumentation, `git diff` rỗng.
+4. Final verify trên tree đã revert: fresh `/tmp/mediroute-r18-test`, `PORT=8082`, live seed 99 → bit-identical R17; compare 5 seeds → bảng trên, baselines cũng bit-identical R17.
+5. Port 8080 không đụng; server test 8082 đã dừng; **không git commit/push**.
+
+**Decision:** **DISCARD — không thay đổi code.** Giả thuyết secondary-peak under-pricing bị bác bỏ: bias dương có hệ thống ở 5/5 seeds và 3/3 sub-windows; max-cap làm calibration tệ hơn. Working tree chỉ giữ section docs này để coordinator đối chiếu; không có candidate nào để commit ngoài docs.
+
+**Bài học:** (1) Cơ chế model-vs-model có thể đúng (demand@ETA > wait_at ở 46% quyết định) nhưng vẫn không tạo under-prediction thực — phải luôn kiểm chứng với **actual wait**, không chỉ so hai estimator. (2) Walk-time drain khiến `wait_at` over-predict gần như mọi nơi, kể cả trong rush phụ; vì vậy mọi cap làm tăng giá (max-cap) là sai hướng. (3) R17 min-cap là can thiệp đúng nhưng có phạm vi; mở rộng nó sang `[150,210)` là giả thuyết khác (min-cap, không phải rising-demand max-cap), có bằng chứng calibration ủng hộ nhưng cần một round riêng để benchmark trước khi kết luận.
