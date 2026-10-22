@@ -1109,3 +1109,94 @@ Các biến thể gate/aggregation (đều không thắng):
 **Decision:** DISCARD — mọi biến thể regression. Chẩn đoán quan trọng: load signal phần lớn TRÙNG thông tin đã có trong est_wait + lookahead (hai thứ đã aggregate cùng facts + λ + internal projection); cost band 25% rất nhạy (α=0.002 đã đủ lật quyết định). Muốn giảm variance thật sự phải đổi điểm can thiệp (global/batch objective) — hướng batch đã fail ở R2.
 
 **Bài học chuỗi (R2, R12):** per-decision router đã bão hòa tại local optimum — mọi can thiệp local (batch window, balance tie-break, additive load) đều regress vì phá cấu trúc cost đã tune. Các hướng còn hứa hẹn: thay đổi PHỤC VỤ (scheduling trong phòng — ví dụ service order theo remaining-tour thay vì FIFO), hoặc thay đổi KỊCH BẢN (nhiều capacity/rooms) rồi đo lại.
+
+---
+
+## Round 13 — SRTF room scheduling (đổi điểm can thiệp: serving policy)
+
+**Status:** ❌ DISCARDED (verify 5 seeds: p90 trung bình regression do starvation — trade avg lấy p90, trái mục tiêu)
+
+**Aspect đề xuất:**
+- Router per-decision đã bão hòa (R2, R12). Round này **không sửa router** mà đổi điểm can thiệp sang **thứ tự phục vụ trong phòng**.
+- Lý thuyết scheduling: SPT/SRTF tối thiểu mean flow time trong single/multi-server queue. FIFO trong mỗi priority class khiến patient còn 1 phòng (xong nhanh) phải chờ sau patient còn 5 phòng.
+- Áp dụng **cùng một policy cho cả 3 strategies** vì đây là chính sách bệnh viện cấp hệ thống; nhờ vậy so sánh routing vẫn công bằng. Hệ quả tất yếu: số của FixedOrder/ShortestQueue **đổi so với R10**, đây là kỳ vọng chứ không phải lỗi.
+- Không đổi router/congestion, API/JSON, frontend, learning, downtime, arrivals. `est_wait` trong router vẫn mô hình hóa queue theo FIFO; SRTF làm wait thật lệch khỏi estimate một chút — chấp nhận được và đã đo qua kết quả.
+
+**Thiết kế:**
+- **Enqueue:** luôn `push_back` — queue vật lý giữ đúng thứ tự arrival, không chèn urgent tại thời điểm enqueue.
+- **Dispatch (khi station rảnh):** quét queue và chọn theo thứ tự:
+  1. **Priority class cao nhất có mặt** trong queue (urgent > normal) — urgent vẫn luôn đi trước normal bất kể tour;
+  2. trong class đó, **remaining tour nhỏ nhất**;
+  3. tie cùng tour → **vị trí queue sớm nhất** (arrival order / FIFO).
+- **Remaining tour** = tổng `est_service_min` **học được** (learner stats) của các `required_rooms` chưa `done`. Phòng đang xếp hàng cũng nằm trong tổng này, nhưng nó là hằng số chung cho mọi candidate trong cùng queue nên không ảnh hưởng thứ tự.
+- **Không preemption:** in-service luôn chạy hết; SRTF chỉ chọn người kế tiếp khi slot trống.
+- **Deterministic:** queue là `VecDeque`, selection quét theo index, so sánh strict `<` nên tie giữ index đầu tiên; không thêm RNG.
+- Implementation nằm trong `sim.rs`: `enqueue`, `remaining_tour_min`, `next_dispatch_index`, `dispatch_room`. `router.rs` và `congestion.rs` không đổi.
+
+**Kết quả compare** (verify chuẩn: fresh `MEDIROUTE_DATA_DIR=/tmp/mediroute-r13-test` → live seed 99 speed 5000→clamp 60 → compare 42/7/123; headless, cùng arrivals/packages/service samples):
+
+Seed 42:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized** | **62.3441** | **2.4480** | **73.9682** | **11.5003** |
+| FixedOrder | 77.1379 | 5.9442 | 132.5264 | 13.4523 |
+| ShortestQueue | 70.3007 | 4.0495 | 106.4523 | 13.5746 |
+
+Seed 7:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized** | **71.9474** | **4.3287** | **134.5026** | **11.9275** |
+| FixedOrder | 83.9108 | 6.9594 | 140.6774 | 13.8233 |
+| ShortestQueue | 78.3727 | 5.6160 | 138.8932 | 13.4266 |
+
+Seed 123:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized** | **72.2136** | **6.5611** | **99.1683** | **10.8479** |
+| FixedOrder | 84.3932 | 9.5697 | 110.5047 | 12.7288 |
+| ShortestQueue | 80.4086 | 8.4379 | 109.7889 | 12.6182 |
+
+Baselines **không còn khớp R10** — đúng kỳ vọng vì serving policy đổi. Ví dụ thay đổi lớn nhất: seed 123 FixedOrder −2.05 avg_total / −34.72 p90_total; ShortestQueue −0.68 / −16.96. Routing logic của hai baseline vẫn nguyên vẹn; chỉ thứ tự được phục vụ trong phòng thay đổi. Vì vậy R13 đánh giá theo (a) Optimized so với số R10, (b) so sánh nội bộ 3 strategies, (c) guardrail p90 — không dùng baseline để đối chiếu chéo R10.
+
+**Đánh giá vs Round 10 (Optimized):**
+
+| Seed | Δ avg_total | Δ avg_wait | Δ p90_total | Δ avg_walk |
+|---|---|---|---|---|
+| 42 | −1.7259 (−2.69%) | −0.4670 (−16.02%) | −3.8186 (−4.91%) | −0.0107 (−0.09%) |
+| 7 | −0.2825 (−0.39%) | −0.0943 (−2.13%) | **+6.3065 (+4.92%)** | +0.0783 (+0.66%) |
+| 123 | −0.0803 (−0.11%) | −0.0358 (−0.54%) | −17.1982 (−14.78%) | +0.0423 (+0.39%) |
+| **Mean 3 seed** | **−0.6962 (−1.00%)** | **−0.1990 (−4.28%)** | **−4.9034 (−4.56%)** | **+0.0366 (+0.32%)** |
+
+- **Tiêu chí (a) — Optimized cải thiện vs R10:** avg_total tốt hơn cả 3 seed (−2.69% / −0.39% / −0.11%), avg_wait tốt hơn cả 3 seed, p90_total tốt hơn seed 42 và 123 (−4.91% / −14.78%) nhưng **tệ hơn seed 7 +4.92%**. Mean 3 seed tốt hơn ở avg_total, avg_wait và p90_total. Đạt theo nghĩa mean + avg_total per-seed; caveat p90 seed 7 nằm sát ngưỡng guardrail.
+- **Tiêu chí (b) — Optimized vẫn tốt nhất trên avg_total + p90_total:** đạt cả 3 seed. Khoảng cách avg_total: s42 7.96 phút trước ShortestQueue/14.79 trước FixedOrder; s7 6.43/11.96; s123 8.20/12.18. Khoảng cách p90_total: s42 32.48/58.56; s7 6.16/8.72; s123 10.62/11.34.
+- **Tiêu chí (c) — p90_total không tệ hơn R10 quá 5%:** đạt, nhưng sát ngưỡng ở seed 7: 134.5026 / 128.1961 = **+4.92%** (< 5%); seed 42 −4.91%, seed 123 −14.78%.
+- Lợi ích lớn nhất ở seed 123 — nơi contention cao và FIFO từng đẩy tail lên mạnh: Optimized p90 −17.20 phút, FixedOrder p90 −34.72, ShortestQueue p90 −16.96. SRTF cải thiện tail cho cả 3 strategies, tức cơ chế tác động đúng như lý thuyết. Seed 7 là ca duy nhất Optimized p90 xấu đi; avg_total vẫn tốt hơn R10 0.28 phút.
+
+Live seed 99 (fresh dir, speed 5000→clamp 60): finished `t = 399.74754874492817` phút, 52/52, 188 visits; **78.1911 / 6.6557 / 150.9359 / 16.2417 / 11.0451** (avg_total/avg_wait/p90_total/p90_wait/avg_walk) vs R10 live 78.0142 / 6.6068 / 146.5977 / 16.4670 / 11.0451. Live gần như trung tính (avg +0.18, p90 +4.34, p90_wait −0.23, walk bằng); điểm mạnh của SRTF nằm ở các seed compare có contention cao.
+
+**Tests — thay đổi expectation và test mới:**
+- 74 test cũ: **1 test đổi expectation** — `urgent_patients_jump_ahead_of_normal_queue` (kiểm tra thứ tự vật lý của queue sau `enqueue`) được thay bằng `urgent_patients_are_dispatched_ahead_of_normal_queue` (kiểm tra thứ tự thực sự được dispatch: capacity 3 → ServiceStart order `[1, 3, 0]`, còn lại `[2]`). Lý do: policy mới cố ý giữ queue theo arrival order và áp priority tại dispatch; giữ assertion cũ sẽ khóa lại hành vi đã bị thay thế. Không có test nào khác bị sửa.
+- **6 test mới:** (1) `srtf_dispatch_picks_shortest_remaining_tour_within_class` — cùng class, tour 8 thắng tour 18; (2) `urgent_dispatch_beats_any_remaining_tour_length` — urgent tour dài nhất vẫn đi trước normal tour ngắn; (3) `equal_remaining_tours_dispatch_in_fifo_order` — tie tour giữ arrival order; (4) `srtf_uses_learned_service_estimates` — một observation làm estimate ECG vượt Blood Test và đảo người được chọn; (5) `srtf_never_preempts_an_in_service_patient` — in-service giữ nguyên, queue chỉ dispatch sau khi slot trống; (6) `two_patient_srtf_dispatch_is_deterministic` — hai world cùng seed/setup cho cùng dispatch order + queue state.
+- `cargo test`: **80/80 pass** (74 cũ + 6 mới, 1 cũ đổi tên/expectation).
+
+**Verify steps:**
+1. `cargo test`: 80/80 pass.
+2. `npm run build`: OK (frontend không đổi; chỉ warning chunk > 500 kB có từ trước).
+3. Fresh `MEDIROUTE_DATA_DIR=/tmp/mediroute-r13-test`, server riêng `PORT=8082`; live `{strategy:optimized, speed:5000, seed:99}` → finished t = 399.7475 phút, 52/52, 188 visits.
+4. `POST /api/sim/compare` seed 42 → 7 → 123; ghi đủ avg_total/avg_wait/p90_total/avg_walk cho **cả 3 strategies**; lặp lại seed 7 cho kết quả bit-identical (deterministic).
+5. Port 8080 không đụng; **không git commit/push**.
+
+**Files changed:** `backend/src/engine/sim.rs` (enqueue + SRTF selection/dispatch + 6 test mới, 1 test cũ đổi expectation), `README.md` (mô tả serving policy + test count), `docs/rounds/README.md`. Không đổi `router.rs`, `congestion.rs`, `domain.rs`, `scenario.rs`, `stats.rs`, `learn.rs`, `api.rs`, `main.rs`, frontend.
+
+**Decision:** **KHÔNG COMMIT theo yêu cầu round.** Về tiêu chí kỹ thuật: (a) đạt có caveat (mean + avg_total tốt hơn; p90 seed 7 +4.92%), (b) đạt, (c) đạt sát ngưỡng. Nếu đây là round commit thông thường, đề xuất COMMIT vì mean cải thiện cả 3 metric chính và cơ chế cải thiện tail rõ ở seed contention cao; tuy nhiên seed 7 p90 chỉ còn biên 0.08 điểm phần trăm dưới ngưỡng 5%, nên cần verify độc lập trước khi chốt.
+
+**Bài học:** (1) Router per-decision đã bão hòa đúng như R12 kết luận; **serving order là điểm can thiệp thật**: chỉ đổi thứ tự dispatch, không đổi một dòng routing nào, mà tail giảm mạnh ở seed 123 cho cả 3 strategies. (2) SRTF dùng learned estimate thay vì service sample nên không cần đọc RNG; deterministic và áp dụng được cho mọi strategy. (3) Priority và SRTF phải kết hợp tại dispatch (không phải lúc enqueue) để urgent luôn thắng, kể cả khi xen giữa queue. (4) Router vẫn mô hình hóa queue FIFO trong `est_wait`, nên SRTF tạo lag nhỏ giữa estimate và wait thật; chưa thấy tác hại hệ thống, nhưng đây là ứng viên chỉnh tiếp nếu muốn khai thác thêm. (5) Benchmark 3 seed vẫn nhạy: seed 7 p90 regression gần chạm guardrail, nhắc lại bài học R12 — cần thêm seed để phân biệt cải thiện cơ chế với nhiễu cascade.
+
+**Verify độc lập (coordinator) — mở rộng 5 seeds:** cargo test 80/80; lặp quy trình chuẩn trên R13 và R10 (worktree): khớp report trên 3 seeds chuẩn (mọi tiêu chí (a)(b)(c) của round đều đạt). NHƯNG trên seeds 5/2024: seed 5 (congested nhất) p90_total 240.05→277.42 (**+15.6%, +37.4 phút**) và Optimized mất vị trí #1 avg về ShortestQueue (116.29 vs 112.85). Mean 5 seeds: avg_total −0.88 nhưng p90_total **+4.53**.
+
+**Decision:** DISCARD — mục tiêu là giảm CẢ avg_total lẫn p90; SRTF cải thiện avg nhẹ nhưng làm tệ p90 trung bình (đúng điểm yếu starvation của SRTF: patient tour dài bị đói đúng lúc contention cao). Tiêu chí 3-seed của round đã đạt nhưng không khái quát — 5-seed evidence (chuẩn từ R8) cho thấy đây là trade-off sai chiều. Code reverted, cargo test 74/74.
+
+**Bài học:** nếu thử lại hướng scheduling, cần hybrid chống starvation (ví dụ aging: effective_tour = tour / (1 + wait_so_far / k)) để SRTF không bỏ đói long-tour patients — hoặc giới hạn SRTF chỉ áp khi queue ngắn. Vấn đề của R13 không phải ý tưởng serving policy mà là thiếu cơ chế bảo vệ tail.
