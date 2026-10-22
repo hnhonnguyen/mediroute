@@ -35,12 +35,28 @@ impl Strategy {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ExpectedArrival {
+    /// Minutes from now until this other patient is free to choose their next
+    /// room, i.e. when their current commitment ends.
+    pub ready_in_min: f64,
+    /// Probability-like weight that the patient actually picks this room
+    /// (shared across their eligible rooms).
+    pub weight: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RoomLoad {
     pub queue_len: usize,
     pub in_service: usize,
     pub pending_starts: usize,
     pub en_route: usize,
+    /// Remaining service minutes for the cohort currently in service.
+    pub in_service_remaining: Vec<f64>,
+    /// Other patients expected to compete for this room soon.
+    pub likely_arrivals: Vec<ExpectedArrival>,
+    /// Minutes until the room reopens after an unplanned outage.
+    pub downtime_remaining_min: f64,
 }
 
 pub struct RouteContext<'a> {
@@ -104,7 +120,7 @@ impl RouteContext<'_> {
     }
 
     fn load(&self, room: &str) -> RoomLoad {
-        self.loads.get(room).copied().unwrap_or_default()
+        self.loads.get(room).cloned().unwrap_or_default()
     }
 
     fn est_service(&self, room: &str) -> f64 {
@@ -138,6 +154,38 @@ impl RouteContext<'_> {
             .count()
     }
 
+    /// Longest chain of still-required downstream rooms. Clearing a room with
+    /// a deep chain releases more of the patient's critical path at once.
+    fn downstream_depth(
+        &self,
+        room: &str,
+        required: &HashSet<&str>,
+        done: &HashSet<&str>,
+    ) -> usize {
+        fn walk(
+            graph: &DependencyGraph,
+            room: &str,
+            required: &HashSet<&str>,
+            done: &HashSet<&str>,
+            memo: &mut HashMap<String, usize>,
+        ) -> usize {
+            if let Some(depth) = memo.get(room) {
+                return *depth;
+            }
+            let mut depth = 0;
+            for dependent in graph.dependents(room) {
+                if !required.contains(dependent.as_str()) || done.contains(dependent.as_str()) {
+                    continue;
+                }
+                depth = depth.max(1 + walk(graph, dependent, required, done, memo));
+            }
+            memo.insert(room.to_string(), depth);
+            depth
+        }
+
+        walk(self.graph, room, required, done, &mut HashMap::new())
+    }
+
     fn compare_optimized(
         &self,
         room_a: &str,
@@ -147,8 +195,9 @@ impl RouteContext<'_> {
         required: &HashSet<&str>,
         done: &HashSet<&str>,
     ) -> Ordering {
-        // `min_by` expects Ordering::Less for the preferred room. Ties fall
-        // through to unblocking potential, then load, then package position.
+        // `min_by` expects Ordering::Less for the preferred room. Costs within
+        // 5% count as a tie so the critical-path tie-breaks can act; clear
+        // cost differences still win outright.
         let cost_a = congestion::route_cost(
             &self.load(room_a),
             self.est_service(room_a),
@@ -159,9 +208,8 @@ impl RouteContext<'_> {
             self.est_service(room_b),
             self.capacity(room_b),
         );
-        let cost_order = cost_a.total_cmp(&cost_b);
-        if cost_order != Ordering::Equal {
-            return cost_order;
+        if !costs_within_percent(cost_a, cost_b, 0.05) {
+            return cost_a.total_cmp(&cost_b);
         }
 
         let unblocks_a = self.unblocks(room_a, required, done);
@@ -169,6 +217,13 @@ impl RouteContext<'_> {
         let unblock_order = unblocks_b.cmp(&unblocks_a);
         if unblock_order != Ordering::Equal {
             return unblock_order;
+        }
+
+        let depth_a = self.downstream_depth(room_a, required, done);
+        let depth_b = self.downstream_depth(room_b, required, done);
+        let depth_order = depth_b.cmp(&depth_a);
+        if depth_order != Ordering::Equal {
+            return depth_order;
         }
 
         let load_a = self.load(room_a);
@@ -182,6 +237,14 @@ impl RouteContext<'_> {
             .cmp(&load_b.queue_len)
             .then_with(|| pos_a.cmp(pos_b))
     }
+}
+
+fn costs_within_percent(a: f64, b: f64, percent: f64) -> bool {
+    let scale = a.abs().max(b.abs());
+    if scale <= f64::EPSILON {
+        return true;
+    }
+    (a - b).abs() / scale <= percent
 }
 
 #[cfg(test)]
@@ -247,6 +310,7 @@ mod tests {
                         in_service: *in_service,
                         pending_starts: *pending_starts,
                         en_route: *en_route,
+                        ..RoomLoad::default()
                     },
                 )
             })
@@ -407,6 +471,87 @@ mod tests {
                 &["blood".to_string(), "endo".to_string()]
             ),
             None
+        );
+    }
+
+    #[test]
+    fn optimized_avoids_room_other_patients_will_likely_join() {
+        let rooms = vec![room("a", 10.0, 1), room("b", 10.0, 1)];
+        let graph = graph(&rooms, &[]);
+        let stats = stats(&rooms, &[]);
+        let mut loads = loads(&[("a", 0, 0, 0, 0), ("b", 0, 0, 0, 0)]);
+        loads.get_mut("a").expect("room a").likely_arrivals = vec![ExpectedArrival {
+            ready_in_min: 0.0,
+            weight: 1.0,
+        }];
+        let ctx = RouteContext {
+            rooms: &rooms,
+            graph: &graph,
+            stats: &stats,
+            loads: &loads,
+        };
+        let required = vec!["a".into(), "b".into()];
+        assert_eq!(
+            ctx.next_room(Strategy::Optimized, &required, &[]),
+            Some("b".to_string())
+        );
+    }
+
+    #[test]
+    fn tie_break_prefers_deeper_dependency_chain_within_cost_band() {
+        // b is marginally cheaper, but a starts a two-room chain (a -> c -> e)
+        // while b only unblocks d. Both unblock one immediate dependent.
+        let rooms = vec![
+            room("a", 10.0, 1),
+            room("b", 10.1, 1),
+            room("c", 10.0, 1),
+            room("d", 10.0, 1),
+            room("e", 10.0, 1),
+        ];
+        let graph = graph(&rooms, &[("a", "c"), ("b", "d"), ("c", "e")]);
+        let stats = stats(&rooms, &[]);
+        let loads = HashMap::new();
+        let ctx = RouteContext {
+            rooms: &rooms,
+            graph: &graph,
+            stats: &stats,
+            loads: &loads,
+        };
+        let required = vec![
+            "b".to_string(),
+            "a".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+            "e".to_string(),
+        ];
+        assert_eq!(
+            ctx.next_room(Strategy::Optimized, &required, &[]),
+            Some("a".to_string())
+        );
+    }
+
+    #[test]
+    fn clear_cost_difference_outranks_critical_path_depth() {
+        let rooms = vec![
+            room("a", 30.0, 1),
+            room("b", 10.0, 1),
+            room("c", 10.0, 1),
+            room("d", 10.0, 1),
+        ];
+        let graph = graph(&rooms, &[("a", "c"), ("c", "d")]);
+        let stats = stats(&rooms, &[]);
+        let loads = HashMap::new();
+        let ctx = RouteContext {
+            rooms: &rooms,
+            graph: &graph,
+            stats: &stats,
+            loads: &loads,
+        };
+        // a is listed first and has the deeper chain, but b is clearly cheaper.
+        let required = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        assert_eq!(
+            ctx.next_room(Strategy::Optimized, &required, &[]),
+            Some("b".to_string())
         );
     }
 }

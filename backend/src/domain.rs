@@ -126,6 +126,7 @@ pub struct Patient {
     pub package_id: String,
     pub package_name: String,
     pub arrival_min: f64,
+    pub priority: PatientPriority,
     pub required_rooms: Vec<String>,
     pub done_rooms: Vec<String>,
     pub status: PatientStatus,
@@ -145,6 +146,14 @@ pub enum PatientStatus {
     InQueue,
     InService,
     Departed,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PatientPriority {
+    #[default]
+    Normal,
+    Urgent,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

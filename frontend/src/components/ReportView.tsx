@@ -135,6 +135,15 @@ export default function ReportView({ report, onClose }: ReportViewProps) {
     },
   ];
 
+  const hasPriorityMetrics = results.some((result) =>
+    [
+      result.metrics.avg_wait_urgent_min,
+      result.metrics.p90_wait_urgent_min,
+      result.metrics.avg_wait_normal_min,
+      result.metrics.p90_wait_normal_min,
+    ].some((value) => typeof value === 'number'),
+  );
+
   const roomRows = optimized?.metrics.room_utilization ?? results[0]?.metrics.room_utilization ?? [];
   const utilizationData: UtilizationRow[] = roomRows.map((room) => {
     const findUtilization = (strategy: Strategy) =>
@@ -313,6 +322,52 @@ export default function ReportView({ report, onClose }: ReportViewProps) {
           </tbody>
         </table>
       </div>
+
+      {hasPriorityMetrics && (
+        <div className="mt-3 overflow-x-auto rounded-xl border border-slate-800">
+          <table className="w-full min-w-[640px] border-collapse text-left text-xs">
+            <thead className="bg-slate-950/50 text-[10px] uppercase tracking-[0.12em] text-slate-500">
+              <tr>
+                <th className="px-4 py-2.5 font-medium">Wait by priority</th>
+                <th className="px-3 py-2.5 text-right font-medium">Urgent avg</th>
+                <th className="px-3 py-2.5 text-right font-medium">Urgent p90</th>
+                <th className="px-3 py-2.5 text-right font-medium">Normal avg</th>
+                <th className="px-4 py-2.5 text-right font-medium">Normal p90</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-800/70">
+              {results.map((result) => (
+                <tr
+                  key={result.strategy}
+                  className={result.strategy === 'optimized' ? 'bg-emerald-500/[0.04]' : ''}
+                >
+                  <td className="px-4 py-2.5">
+                    <span className="inline-flex items-center gap-2 font-medium text-slate-200">
+                      <span
+                        className="h-2 w-2 rounded-full"
+                        style={{ backgroundColor: COLORS[result.strategy] }}
+                      />
+                      {result.label}
+                    </span>
+                  </td>
+                  <td className="px-3 py-2.5 text-right tabular-nums text-rose-300">
+                    {formatMinutes(result.metrics.avg_wait_urgent_min)}
+                  </td>
+                  <td className="px-3 py-2.5 text-right tabular-nums text-rose-300/80">
+                    {formatMinutes(result.metrics.p90_wait_urgent_min)}
+                  </td>
+                  <td className="px-3 py-2.5 text-right tabular-nums text-slate-300">
+                    {formatMinutes(result.metrics.avg_wait_normal_min)}
+                  </td>
+                  <td className="px-4 py-2.5 text-right tabular-nums text-slate-400">
+                    {formatMinutes(result.metrics.p90_wait_normal_min)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </section>
   );
 }

@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::domain::{Patient, PatientStatus};
+use crate::domain::{Patient, PatientPriority, PatientStatus};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RoomUtilization {
@@ -23,6 +23,10 @@ pub struct Metrics {
     pub avg_wait_min: f64,
     pub p90_total_min: f64,
     pub p90_wait_min: f64,
+    pub avg_wait_urgent_min: f64,
+    pub p90_wait_urgent_min: f64,
+    pub avg_wait_normal_min: f64,
+    pub p90_wait_normal_min: f64,
     pub total_visits: usize,
     pub room_utilization: Vec<RoomUtilization>,
 }
@@ -46,6 +50,10 @@ impl Metrics {
             avg_wait_min: 0.0,
             p90_total_min: 0.0,
             p90_wait_min: 0.0,
+            avg_wait_urgent_min: 0.0,
+            p90_wait_urgent_min: 0.0,
+            avg_wait_normal_min: 0.0,
+            p90_wait_normal_min: 0.0,
             total_visits: 0,
             room_utilization: Vec::new(),
         }
@@ -72,6 +80,16 @@ pub fn aggregate(patients: &[Patient], rooms: &[RoomUsage], now_min: f64) -> Met
         .flat_map(|patient| patient.visits.iter().map(|visit| visit.wait_min))
         .collect();
     let total_visits = waits.len();
+
+    let waits_for = |priority: PatientPriority| -> Vec<f64> {
+        patients
+            .iter()
+            .filter(|patient| patient.priority == priority)
+            .flat_map(|patient| patient.visits.iter().map(|visit| visit.wait_min))
+            .collect()
+    };
+    let urgent_waits = waits_for(PatientPriority::Urgent);
+    let normal_waits = waits_for(PatientPriority::Normal);
 
     let avg_total_min = mean(&total_times);
     let avg_wait_min = mean(&waits);
@@ -107,6 +125,10 @@ pub fn aggregate(patients: &[Patient], rooms: &[RoomUsage], now_min: f64) -> Met
         avg_wait_min,
         p90_total_min,
         p90_wait_min,
+        avg_wait_urgent_min: mean(&urgent_waits),
+        p90_wait_urgent_min: percentile_90(&urgent_waits),
+        avg_wait_normal_min: mean(&normal_waits),
+        p90_wait_normal_min: percentile_90(&normal_waits),
         total_visits,
         room_utilization,
     }
@@ -132,7 +154,44 @@ fn percentile_90(values: &[f64]) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use crate::domain::VisitRecord;
+
     use super::*;
+
+    fn patient(priority: PatientPriority, id: u32, waits: &[f64]) -> Patient {
+        Patient {
+            id,
+            name: format!("Patient {id}"),
+            package_id: "pkg".into(),
+            package_name: "Package".into(),
+            arrival_min: 0.0,
+            priority,
+            required_rooms: Vec::new(),
+            done_rooms: Vec::new(),
+            status: PatientStatus::Departed,
+            current_room: None,
+            enroute_since: None,
+            queue_joined_at: None,
+            departed_at: Some(30.0),
+            visits: waits
+                .iter()
+                .enumerate()
+                .map(|(index, wait)| VisitRecord {
+                    patient_id: id,
+                    patient_name: format!("Patient {id}"),
+                    room_id: format!("room_{index}"),
+                    arrival_at_room: 0.0,
+                    service_start: *wait,
+                    service_end: wait + 1.0,
+                    wait_min: *wait,
+                    service_min: 1.0,
+                })
+                .collect(),
+            service_samples: HashMap::new(),
+        }
+    }
 
     #[test]
     fn percentile_uses_nearest_rank() {
@@ -140,5 +199,19 @@ mod tests {
         assert_eq!(percentile_90(&values), 9.0);
         assert_eq!(percentile_90(&[42.0]), 42.0);
         assert_eq!(percentile_90(&[]), 0.0);
+    }
+
+    #[test]
+    fn priority_wait_metrics_are_reported_separately() {
+        let patients = vec![
+            patient(PatientPriority::Urgent, 1, &[1.0, 2.0]),
+            patient(PatientPriority::Normal, 2, &[10.0, 20.0]),
+        ];
+        let metrics = aggregate(&patients, &[], 30.0);
+        assert!((metrics.avg_wait_urgent_min - 1.5).abs() < 1e-9);
+        assert!((metrics.p90_wait_urgent_min - 2.0).abs() < 1e-9);
+        assert!((metrics.avg_wait_normal_min - 15.0).abs() < 1e-9);
+        assert!((metrics.p90_wait_normal_min - 20.0).abs() < 1e-9);
+        assert!((metrics.avg_wait_min - 8.25).abs() < 1e-9);
     }
 }

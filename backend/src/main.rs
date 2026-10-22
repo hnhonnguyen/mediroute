@@ -16,7 +16,9 @@ async fn main() {
         .validate()
         .expect("built-in demo scenario must be a valid DAG");
     let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let data_dir = crate_dir.join("data");
+    let data_dir = std::env::var("MEDIROUTE_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| crate_dir.join("data"));
     if let Err(error) = std::fs::create_dir_all(&data_dir) {
         eprintln!("warning: could not create data directory: {error}");
     }
@@ -43,8 +45,12 @@ async fn main() {
     }
     .layer(CorsLayer::permissive());
 
-    let address = "0.0.0.0:8080";
-    let listener = tokio::net::TcpListener::bind(address)
+    let port = std::env::var("PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(8080);
+    let address = format!("0.0.0.0:{port}");
+    let listener = tokio::net::TcpListener::bind(&address)
         .await
         .unwrap_or_else(|error| panic!("failed to bind {address}: {error}"));
     println!("MediRoute backend listening on http://{address}");

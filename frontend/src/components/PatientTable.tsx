@@ -99,7 +99,17 @@ export default function PatientTable({ patients }: PatientTableProps) {
                     }
                   >
                     <td className="px-4 py-3 align-top sm:px-5">
-                      <p className="font-medium text-slate-100">{patient.name}</p>
+                      <div className="flex items-center gap-1.5">
+                        <p className="font-medium text-slate-100">{patient.name}</p>
+                        {patient.priority === 'urgent' && (
+                          <span
+                            className="rounded border border-rose-500/40 bg-rose-500/15 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.08em] text-rose-300"
+                            title="Urgent patients are served ahead of the normal queue"
+                          >
+                            Urgent
+                          </span>
+                        )}
+                      </div>
                       <p className="mt-0.5 text-[11px] text-slate-500">
                         #{String(patient.id).padStart(2, '0')} · {patient.package_name}
                       </p>

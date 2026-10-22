@@ -44,6 +44,8 @@ export default function RoomGrid({ rooms }: RoomGridProps) {
         <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
           {rooms.map((room) => {
             const heat = heatStyle(room.est_wait_min);
+            const down = room.downtime_active === true;
+            const downtimeLeft = Math.ceil(room.downtime_remaining_min ?? 0);
             const deltaPct =
               room.initial_avg_service_min > 0
                 ? ((room.est_service_min - room.initial_avg_service_min) /
@@ -51,11 +53,20 @@ export default function RoomGrid({ rooms }: RoomGridProps) {
                   100
                 : 0;
             const deltaPositive = deltaPct >= 0;
+            const cardStyle = down
+              ? {
+                  background:
+                    'repeating-linear-gradient(135deg, rgba(51, 65, 85, 0.55) 0px, rgba(51, 65, 85, 0.55) 9px, rgba(15, 23, 42, 0.92) 9px, rgba(15, 23, 42, 0.92) 18px)',
+                  borderColor: 'rgba(148, 163, 184, 0.4)',
+                }
+              : { background: heat.background, borderColor: heat.borderColor };
             return (
               <article
                 key={room.id}
-                className="relative overflow-hidden rounded-xl border p-4 transition-colors"
-                style={{ background: heat.background, borderColor: heat.borderColor }}
+                className={`relative overflow-hidden rounded-xl border p-4 transition-colors ${
+                  down ? 'text-slate-300' : ''
+                }`}
+                style={cardStyle}
               >
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
@@ -64,23 +75,34 @@ export default function RoomGrid({ rooms }: RoomGridProps) {
                       {room.capacity} parallel {room.capacity === 1 ? 'station' : 'stations'}
                     </p>
                   </div>
-                  <span className="shrink-0 rounded-full border border-white/10 bg-black/20 px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.1em] text-slate-300">
-                    {room.visit_count} obs
-                  </span>
+                  <div className="flex shrink-0 flex-col items-end gap-1">
+                    {down && (
+                      <span className="rounded-full border border-slate-400/30 bg-slate-700/60 px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.1em] text-slate-100">
+                        Downtime · {downtimeLeft}m
+                      </span>
+                    )}
+                    <span className="rounded-full border border-white/10 bg-black/20 px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.1em] text-slate-300">
+                      {room.visit_count} obs
+                    </span>
+                  </div>
                 </div>
 
                 <div className="mt-3 flex items-end gap-2">
                   <p className="text-2xl font-semibold tracking-tight text-white">
-                    {room.est_wait_min.toFixed(1)}
+                    {down ? downtimeLeft : room.est_wait_min.toFixed(1)}
                   </p>
-                  <span className="pb-0.5 text-xs text-slate-300">min est. wait</span>
+                  <span className="pb-0.5 text-xs text-slate-300">
+                    {down ? 'min until room reopens' : 'min est. wait'}
+                  </span>
                 </div>
                 <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-black/30">
                   <div
                     className="h-full rounded-full transition-all duration-500"
                     style={{
-                      width: `${Math.max(3, clamp(room.est_wait_min / 30, 0, 1) * 100)}%`,
-                      backgroundColor: heat.barColor,
+                      width: down
+                        ? '100%'
+                        : `${Math.max(3, clamp(room.est_wait_min / 30, 0, 1) * 100)}%`,
+                      backgroundColor: down ? 'rgba(148, 163, 184, 0.7)' : heat.barColor,
                     }}
                   />
                 </div>

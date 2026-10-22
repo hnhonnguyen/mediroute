@@ -7,6 +7,8 @@ export type PatientStatus =
   | 'in_service'
   | 'departed';
 
+export type PatientPriority = 'normal' | 'urgent';
+
 export interface RoomConfig {
   id: string;
   name: string;
@@ -52,6 +54,10 @@ export interface Metrics {
   avg_wait_min: number;
   p90_total_min: number;
   p90_wait_min: number;
+  avg_wait_urgent_min?: number;
+  p90_wait_urgent_min?: number;
+  avg_wait_normal_min?: number;
+  p90_wait_normal_min?: number;
   total_visits: number;
   room_utilization: RoomUtilization[];
 }
@@ -69,6 +75,9 @@ export interface RoomView {
   en_route: number;
   est_wait_min: number;
   utilization_pct: number;
+  downtime_active?: boolean;
+  downtime_until?: number | null;
+  downtime_remaining_min?: number;
 }
 
 export interface PatientVisitView {
@@ -85,6 +94,7 @@ export interface PatientView {
   package_id: string;
   package_name: string;
   arrival_min: number;
+  priority?: PatientPriority;
   status: PatientStatus;
   current_room: string | null;
   current_room_name: string | null;

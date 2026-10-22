@@ -8,8 +8,9 @@ visits, so its estimates keep improving as the day goes on.
 
 ## What it does
 
-- **Real-time routing**: after each checkup the patient's next room is re-decided from live queue
-  lengths, in-service patients, patients already walking there, learned service times, and the
+- **Real-time routing**: after each checkup the patient's next room is re-decided from projected
+  station-free times (including the remaining service time of everyone currently in service),
+  queued and en-route patients, likely competitors, room downtime, learned service times, and the
   dependency DAG.
 - **Continuous learning**: every completed service writes a `VisitRecord` with actual wait and
   actual service time. A room's estimate updates with EWMA (alpha 0.3); configured values are only
@@ -73,11 +74,21 @@ When a patient arrives or finishes a checkup:
 
 1. **Eligibility**: required rooms that are not done and whose prerequisites (restricted to rooms
    in that patient's package) are complete.
-2. **Cost**: `est_wait + est_service + walk_time`, where
-   `est_wait = people_ahead × est_service / capacity` and `people_ahead` counts in-queue,
-   in-service, pending starts, and en-route patients. The walk time is 2 minutes.
-3. **Choice**: lowest cost. Ties prefer the room that unblocks more dependent rooms, then fewer
-   en-route patients, shorter queue, and earlier package position.
+2. **Predictive wait**: each room is projected as a set of service stations. In-service patients
+   contribute their actual remaining service time (`service_end − now`), and queued, pending,
+   en-route, and likely-arriving patients consume the earliest free station in FIFO order. A room
+   that is offline cannot hand out a station until it reopens. `est_wait` is the earliest time a
+   station frees up for this patient.
+3. **Anti-herding lookahead**: patients who are about to finish elsewhere and are eligible for the
+   same room are added as weighted, expected competitors, so many patients do not all pile into the
+   room that looks empty right now.
+4. **Cost**: `est_wait + est_service + walk_time` (walk time is 2 minutes).
+5. **Choice**: lowest cost. Costs within 5% are treated as ties; ties prefer the room that unblocks
+   more dependent rooms, then the longest downstream dependency chain, then fewer en-route
+   patients, shorter queue, and earlier package position.
+
+`FixedOrder` and `ShortestQueue` intentionally keep their original, congestion-blind behavior so
+the comparison stays fair.
 
 Strategies:
 
@@ -96,7 +107,20 @@ Dependencies: Blood Test → Endocrinology, Blood Test → Cardiology, X-Ray →
 ECG → Cardiology. A dependency applies only when both rooms are in the patient's package.
 
 Five packages: General Checkup, Cardiac Screen, Joint Pain, Thyroid Check, Full Premium. A seeded
-run creates 52 patients arriving over roughly 88 simulated minutes.
+run creates 52 patients with rush-hour arrivals: a primary 08:00-10:00 burst (65% of patients), a
+quiet 10:00-10:30 gap, and a secondary 10:30-11:30 burst (minute 0 is 08:00).
+
+Realism features:
+
+- **Room downtime**: each room has a 15% chance of one seeded 10-20 minute outage per run.
+  In-service patients finish normally, queued patients wait, and the room card turns gray/striped
+  while it is offline.
+- **Patient priorities**: roughly 10% of patients are `urgent`. Urgent patients go ahead of normal
+  patients in every queue while preserving FIFO within each priority class. The patient table shows
+  an urgent badge.
+- **Priority metrics**: `/api/sim/status` and `/api/sim/compare` report average and p90 wait
+  separately for urgent and normal patients (`avg_wait_urgent_min`, `p90_wait_urgent_min`,
+  `avg_wait_normal_min`, `p90_wait_normal_min`).
 
 ## API
 
@@ -108,11 +132,14 @@ All endpoints are under `/api` and return JSON.
 | POST | `/sim/start` | `{ "strategy": "optimized", "speed": 5, "seed"?: 42, "patient_count"?: 52 }` |
 | POST | `/sim/pause` / `/sim/resume` / `/sim/reset` | Live simulation controls |
 | POST | `/sim/speed` | `{ "speed": 10 }` — update speed while running |
-| GET | `/sim/status` | Clock, run state, metrics, strategy, seed |
+| GET | `/sim/status` | Clock, run state, metrics (incl. urgent/normal waits), strategy, seed |
 | POST | `/sim/compare` | `{ "seed": 42, "patient_count"?: 52 }` — headless run of all strategies |
-| GET | `/rooms` | Live congestion and learned stats per room |
-| GET | `/patients` | Status, progress, elapsed time, per-room actuals |
+| GET | `/rooms` | Live congestion, learned stats, and downtime (`downtime_active`, `downtime_remaining_min`) per room |
+| GET | `/patients` | Status, `priority` (`normal`/`urgent`), progress, elapsed time, per-room actuals |
 | GET | `/history` | Recent visit records (actual wait and service time) |
+
+Set `PORT` to bind a different port (default 8080) and `MEDIROUTE_DATA_DIR` to keep learned data in
+an alternate directory (useful for isolated test servers).
 
 ## Tests and build
 
@@ -121,10 +148,12 @@ cd backend && cargo test
 cd frontend && npm run build
 ```
 
-The backend suite (24 tests) covers DAG validation and cycle detection, dependency-aware
-eligibility, congestion and en-route-aware routing, the learned-vs-seed estimate, EWMA convergence,
-persistence round-trips, seeded determinism, all-patients-depart completion, single-room packages,
-and Optimized beating Fixed Order on a fixed seed.
+The backend suite (41 tests) covers DAG validation and cycle detection, dependency-aware
+eligibility, predictive station-free waits, anti-herding and en-route-aware routing, the 5% cost
+band and longest-chain tie-break, the learned-vs-seed estimate, EWMA convergence, persistence
+round-trips, seeded determinism, all-patients-depart completion, single-room packages, rush-hour
+bursts, urgent FIFO priority, downtime holding queues while in-service visits finish, urgent/normal
+wait metrics, and Optimized beating Fixed Order on a fixed seed.
 
 ## Project layout
 

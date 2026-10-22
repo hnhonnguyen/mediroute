@@ -1,7 +1,23 @@
 use crate::domain::{DependencyEdge, Package, Room, Scenario, WALK_TIME_MIN};
 
 pub const DEFAULT_PATIENT_COUNT: usize = 52;
-pub const DEFAULT_ARRIVAL_WINDOW_MIN: f64 = 88.0;
+/// The simulated day starts at 08:00, so minute 0 is 08:00 and minute 210 is
+/// 11:30. Arrivals cluster into a primary 08:00-10:00 rush and a smaller
+/// 10:30-11:30 secondary rush instead of spreading uniformly.
+pub const DEFAULT_ARRIVAL_WINDOW_MIN: f64 = 210.0;
+pub const PRIMARY_PEAK_START_MIN: f64 = 0.0;
+pub const PRIMARY_PEAK_END_MIN: f64 = 120.0;
+pub const SECONDARY_PEAK_START_MIN: f64 = 150.0;
+pub const SECONDARY_PEAK_END_MIN: f64 = 210.0;
+pub const PRIMARY_PEAK_SHARE: f64 = 0.65;
+
+/// Each room has this chance of one unplanned outage per run.
+pub const DOWNTIME_PROBABILITY: f64 = 0.15;
+pub const DOWNTIME_MIN_MIN: f64 = 10.0;
+pub const DOWNTIME_MAX_MIN: f64 = 20.0;
+
+/// Percentage of patients who receive expedited queue treatment.
+pub const URGENT_PATIENT_SHARE: f64 = 0.10;
 
 pub fn demo_scenario() -> Scenario {
     let rooms = vec![

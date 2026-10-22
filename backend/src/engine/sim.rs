@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 use rand::rngs::StdRng;
@@ -7,14 +7,18 @@ use rand::{Rng, SeedableRng};
 use serde::Serialize;
 
 use crate::domain::{
-    DependencyGraph, Package, Patient, PatientStatus, Room, RoomStats, Scenario, VisitRecord,
-    WALK_TIME_MIN,
+    DependencyGraph, Package, Patient, PatientPriority, PatientStatus, Room, RoomStats, Scenario,
+    VisitRecord, WALK_TIME_MIN,
 };
-use crate::scenario::{DEFAULT_ARRIVAL_WINDOW_MIN, DEFAULT_PATIENT_COUNT};
+use crate::scenario::{
+    DEFAULT_ARRIVAL_WINDOW_MIN, DOWNTIME_MAX_MIN, DOWNTIME_MIN_MIN,
+    DOWNTIME_PROBABILITY, PRIMARY_PEAK_END_MIN, PRIMARY_PEAK_SHARE, PRIMARY_PEAK_START_MIN,
+    SECONDARY_PEAK_END_MIN, SECONDARY_PEAK_START_MIN, URGENT_PATIENT_SHARE,
+};
 
 use super::congestion;
 use super::learn::Learner;
-use super::router::{RouteContext, RoomLoad, Strategy};
+use super::router::{ExpectedArrival, RouteContext, RoomLoad, Strategy};
 use super::stats::{self, Metrics, RoomUsage};
 
 pub const DEFAULT_SIM_SPEED: f64 = 5.0;
@@ -45,6 +49,9 @@ pub struct RoomView {
     pub en_route: usize,
     pub est_wait_min: f64,
     pub utilization_pct: f64,
+    pub downtime_active: bool,
+    pub downtime_until: Option<f64>,
+    pub downtime_remaining_min: f64,
 }
 
 impl RoomView {
@@ -70,6 +77,9 @@ impl RoomView {
                     en_route: 0,
                     est_wait_min: 0.0,
                     utilization_pct: 0.0,
+                    downtime_active: false,
+                    downtime_until: None,
+                    downtime_remaining_min: 0.0,
                 }
             })
             .collect()
@@ -92,6 +102,7 @@ pub struct PatientView {
     pub package_id: String,
     pub package_name: String,
     pub arrival_min: f64,
+    pub priority: PatientPriority,
     pub status: PatientStatus,
     pub current_room: Option<String>,
     pub current_room_name: Option<String>,
@@ -108,6 +119,7 @@ pub struct PatientView {
 struct InService {
     patient: usize,
     started_at: f64,
+    ends_at: f64,
 }
 
 struct RoomState {
@@ -116,6 +128,7 @@ struct RoomState {
     pending_starts: usize,
     busy_min: f64,
     visits: usize,
+    down_until: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +138,8 @@ enum Event {
     ServiceStart { patient: usize, room: usize },
     ServiceEnd { patient: usize, room: usize },
     Departure { patient: usize },
+    RoomDowntimeStart { room: usize, duration_min: f64 },
+    RoomDowntimeEnd { room: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +216,7 @@ impl World {
                 pending_starts: 0,
                 busy_min: 0.0,
                 visits: 0,
+                down_until: None,
             })
             .collect();
 
@@ -213,7 +229,12 @@ impl World {
                 FIRST_NAMES[rng.gen_range(0..FIRST_NAMES.len())],
                 LAST_NAMES[rng.gen_range(0..LAST_NAMES.len())]
             );
-            let arrival_min = rng.gen_range(0.0..DEFAULT_ARRIVAL_WINDOW_MIN);
+            let arrival_min = sample_arrival_min(&mut rng);
+            let priority = if rng.gen_bool(URGENT_PATIENT_SHARE) {
+                PatientPriority::Urgent
+            } else {
+                PatientPriority::Normal
+            };
             let mut service_samples = HashMap::new();
             for room_id in &required_rooms {
                 let mean = true_service_mean(room_id);
@@ -226,6 +247,7 @@ impl World {
                 package_id: package.id.clone(),
                 package_name: package.name.clone(),
                 arrival_min,
+                priority,
                 required_rooms,
                 done_rooms: Vec::new(),
                 status: PatientStatus::Arrived,
@@ -262,6 +284,7 @@ impl World {
             let at = world.patients[idx].arrival_min;
             world.schedule(at, Event::Arrival { patient: idx });
         }
+        world.schedule_downtime_windows(&mut rng);
         world
     }
 
@@ -356,7 +379,7 @@ impl World {
     }
 
     pub fn room_views(&self) -> Vec<RoomView> {
-        let loads = self.room_loads();
+        let loads = self.room_loads(None);
         self.scenario_rooms
             .iter()
             .map(|room| {
@@ -364,11 +387,14 @@ impl World {
                 let est_service = learned
                     .map(|stats| stats.est_service_min)
                     .unwrap_or(room.initial_avg_service_min);
-                let load = loads.get(&room.id).copied().unwrap_or_default();
+                let load = loads.get(&room.id).cloned().unwrap_or_default();
+                let state = &self.rooms[self.room_index[&room.id]];
+                let downtime_remaining_min = state
+                    .down_until
+                    .map(|until| (until - self.now).max(0.0))
+                    .unwrap_or(0.0);
                 let utilization_pct = if self.now > 0.0 {
-                    self.rooms[self.room_index[&room.id]].busy_min
-                        / (self.now * room.capacity as f64).max(1e-9)
-                        * 100.0
+                    state.busy_min / (self.now * room.capacity as f64).max(1e-9) * 100.0
                 } else {
                     0.0
                 };
@@ -387,6 +413,9 @@ impl World {
                     en_route: load.en_route,
                     est_wait_min: congestion::est_wait_min(&load, est_service, room.capacity),
                     utilization_pct,
+                    downtime_active: downtime_remaining_min > 0.0,
+                    downtime_until: state.down_until,
+                    downtime_remaining_min,
                 }
             })
             .collect()
@@ -428,6 +457,7 @@ impl World {
                     package_id: patient.package_id.clone(),
                     package_name: patient.package_name.clone(),
                     arrival_min: patient.arrival_min,
+                    priority: patient.priority,
                     status: patient.status,
                     current_room: patient.current_room.clone(),
                     current_room_name: patient.current_room.as_ref().map(name_of),
@@ -480,7 +510,7 @@ impl World {
                     state.status = PatientStatus::InQueue;
                     state.queue_joined_at = Some(self.now);
                 }
-                self.rooms[room].queue.push_back(patient);
+                self.enqueue(room, patient);
                 self.dispatch_room(room);
             }
             Event::ServiceStart { patient, room } => {
@@ -498,14 +528,13 @@ impl World {
                     patient_state.status = PatientStatus::InService;
                     patient_state.current_room = Some(room_id);
                 }
+                let ends_at = self.now + duration;
                 self.rooms[room].in_service.push(InService {
                     patient,
                     started_at: self.now,
+                    ends_at,
                 });
-                self.schedule(
-                    self.now + duration,
-                    Event::ServiceEnd { patient, room },
-                );
+                self.schedule(ends_at, Event::ServiceEnd { patient, room });
             }
             Event::ServiceEnd { patient, room } => {
                 let Some(service_pos) = self.rooms[room]
@@ -568,11 +597,60 @@ impl World {
                     self.finished_at = Some(self.now);
                 }
             }
+            Event::RoomDowntimeStart { room, duration_min } => {
+                let until = self.now + duration_min.max(0.0);
+                self.rooms[room].down_until = Some(until);
+                self.schedule(until, Event::RoomDowntimeEnd { room });
+            }
+            Event::RoomDowntimeEnd { room } => {
+                self.rooms[room].down_until = None;
+                self.dispatch_room(room);
+            }
+        }
+    }
+
+    /// Each room independently may take one unplanned 10-20 minute outage.
+    fn schedule_downtime_windows(&mut self, rng: &mut StdRng) {
+        let latest_start = (DEFAULT_ARRIVAL_WINDOW_MIN * 0.8 - DOWNTIME_MAX_MIN).max(15.0);
+        for room in 0..self.scenario_rooms.len() {
+            if !rng.gen_bool(DOWNTIME_PROBABILITY) {
+                continue;
+            }
+            let start = rng.gen_range(15.0..latest_start);
+            let duration = rng.gen_range(DOWNTIME_MIN_MIN..DOWNTIME_MAX_MIN);
+            self.schedule(
+                start,
+                Event::RoomDowntimeStart {
+                    room,
+                    duration_min: duration,
+                },
+            );
+        }
+    }
+
+    fn enqueue(&mut self, room: usize, patient: usize) {
+        if self.patients[patient].priority == PatientPriority::Urgent {
+            // Urgent patients go ahead of normals while preserving FIFO order
+            // within each priority class.
+            let position = self.rooms[room]
+                .queue
+                .iter()
+                .position(|queued| self.patients[*queued].priority == PatientPriority::Normal)
+                .unwrap_or_else(|| self.rooms[room].queue.len());
+            self.rooms[room].queue.insert(position, patient);
+        } else {
+            self.rooms[room].queue.push_back(patient);
         }
     }
 
     fn dispatch_room(&mut self, room: usize) {
         loop {
+            if self.rooms[room]
+                .down_until
+                .is_some_and(|until| self.now < until)
+            {
+                break;
+            }
             let state = &self.rooms[room];
             let busy = state.in_service.len() + state.pending_starts;
             if busy >= self.scenario_rooms[room].capacity {
@@ -603,7 +681,7 @@ impl World {
     }
 
     fn next_room(&self, patient: usize) -> Option<String> {
-        let loads = self.room_loads();
+        let loads = self.room_loads(Some(patient));
         let patient = &self.patients[patient];
         let context = RouteContext {
             rooms: &self.scenario_rooms,
@@ -614,17 +692,32 @@ impl World {
         context.next_room(self.strategy, &patient.required_rooms, &patient.done_rooms)
     }
 
-    fn room_loads(&self) -> HashMap<String, RoomLoad> {
+    fn room_loads(&self, deciding_patient: Option<usize>) -> HashMap<String, RoomLoad> {
         let mut loads: HashMap<String, RoomLoad> = self
             .scenario_rooms
             .iter()
             .map(|room| (room.id.clone(), RoomLoad::default()))
             .collect();
+        let mut in_service_remaining = HashMap::new();
         for (idx, state) in self.rooms.iter().enumerate() {
+            let remaining: Vec<f64> = state
+                .in_service
+                .iter()
+                .map(|entry| (entry.ends_at - self.now).max(0.0))
+                .collect();
+            for entry in &state.in_service {
+                in_service_remaining
+                    .insert(entry.patient, (entry.ends_at - self.now).max(0.0));
+            }
             if let Some(load) = loads.get_mut(&self.scenario_rooms[idx].id) {
                 load.queue_len = state.queue.len();
                 load.in_service = state.in_service.len();
                 load.pending_starts = state.pending_starts;
+                load.in_service_remaining = remaining;
+                load.downtime_remaining_min = state
+                    .down_until
+                    .map(|until| (until - self.now).max(0.0))
+                    .unwrap_or(0.0);
             }
         }
         for patient in &self.patients {
@@ -636,7 +729,129 @@ impl World {
                 }
             }
         }
+        if let Some(patient) = deciding_patient {
+            self.add_likely_arrivals(&mut loads, patient, &in_service_remaining);
+        }
         loads
+    }
+
+    /// Anti-herding lookahead: estimate which other patients will finish their
+    /// current commitment soon and how likely each is to pick a given room.
+    /// En-route patients are already counted separately as an immediate load.
+    fn add_likely_arrivals(
+        &self,
+        loads: &mut HashMap<String, RoomLoad>,
+        deciding_patient: usize,
+        in_service_remaining: &HashMap<usize, f64>,
+    ) {
+        for (idx, patient) in self.patients.iter().enumerate() {
+            if idx == deciding_patient {
+                continue;
+            }
+            let current_room = patient.current_room.as_deref();
+            let ready_in_min = match patient.status {
+                PatientStatus::InService => {
+                    in_service_remaining.get(&idx).copied().unwrap_or(0.0)
+                }
+                PatientStatus::InQueue => {
+                    let Some(room_id) = current_room else {
+                        continue;
+                    };
+                    let est_service = self.estimated_service(room_id);
+                    let load = loads.get(room_id).cloned().unwrap_or_default();
+                    congestion::est_wait_min(&load, est_service, self.room_capacity(room_id))
+                        + est_service
+                }
+                PatientStatus::EnRoute => {
+                    let Some(room_id) = current_room else {
+                        continue;
+                    };
+                    let walk_left = patient
+                        .enroute_since
+                        .map(|since| (since + WALK_TIME_MIN - self.now).max(0.0))
+                        .unwrap_or(0.0);
+                    let est_service = self.estimated_service(room_id);
+                    let load = loads.get(room_id).cloned().unwrap_or_default();
+                    walk_left
+                        + congestion::est_wait_min(&load, est_service, self.room_capacity(room_id))
+                        + est_service
+                }
+                PatientStatus::Arrived => {
+                    if patient.arrival_min > self.now {
+                        continue;
+                    }
+                    0.0
+                }
+                PatientStatus::Departed => continue,
+            };
+
+            let done_after: HashSet<&str> = patient
+                .done_rooms
+                .iter()
+                .map(String::as_str)
+                .chain(current_room)
+                .collect();
+            let required: HashSet<&str> = patient
+                .required_rooms
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let eligible: Vec<&str> = patient
+                .required_rooms
+                .iter()
+                .filter(|room| !done_after.contains(room.as_str()))
+                .filter(|room| {
+                    self.graph.prerequisites(room).iter().all(|prereq| {
+                        !required.contains(prereq.as_str()) || done_after.contains(prereq.as_str())
+                    })
+                })
+                .map(String::as_str)
+                .collect();
+            if eligible.is_empty() {
+                continue;
+            }
+            let weight = 1.0 / eligible.len() as f64;
+            for room_id in eligible {
+                if let Some(load) = loads.get_mut(room_id) {
+                    load.likely_arrivals.push(ExpectedArrival {
+                        ready_in_min,
+                        weight,
+                    });
+                }
+            }
+        }
+    }
+
+    fn estimated_service(&self, room_id: &str) -> f64 {
+        self.learner
+            .stats()
+            .get(room_id)
+            .map(|stats| stats.est_service_min)
+            .or_else(|| {
+                self.scenario_rooms
+                    .iter()
+                    .find(|room| room.id == room_id)
+                    .map(|room| room.initial_avg_service_min)
+            })
+            .unwrap_or(10.0)
+    }
+
+    fn room_capacity(&self, room_id: &str) -> usize {
+        self.scenario_rooms
+            .iter()
+            .find(|room| room.id == room_id)
+            .map(|room| room.capacity)
+            .unwrap_or(1)
+    }
+}
+
+/// Two seeded rush-hour bursts with a quiet gap between them. Minute 0 is
+/// 08:00, so the peaks cover 08:00-10:00 and 10:30-11:30.
+fn sample_arrival_min(rng: &mut StdRng) -> f64 {
+    if rng.gen::<f64>() < PRIMARY_PEAK_SHARE {
+        rng.gen_range(PRIMARY_PEAK_START_MIN..PRIMARY_PEAK_END_MIN)
+    } else {
+        rng.gen_range(SECONDARY_PEAK_START_MIN..SECONDARY_PEAK_END_MIN)
     }
 }
 
@@ -675,7 +890,7 @@ mod tests {
     use super::*;
     use crate::domain::Package;
     use crate::engine::learn::Learner;
-    use crate::scenario::demo_scenario;
+    use crate::scenario::{demo_scenario, DEFAULT_PATIENT_COUNT};
 
     fn demo_world(strategy: Strategy, seed: u64, count: usize) -> World {
         let scenario = demo_scenario();
@@ -779,5 +994,130 @@ mod tests {
             before,
             true_service_mean("ecg")
         );
+    }
+
+    #[test]
+    fn patients_arrive_in_two_rush_hour_bursts() {
+        let world = demo_world(Strategy::Optimized, 42, DEFAULT_PATIENT_COUNT);
+        let arrivals: Vec<f64> = world.patients.iter().map(|p| p.arrival_min).collect();
+        let primary = arrivals
+            .iter()
+            .filter(|at| **at < PRIMARY_PEAK_END_MIN)
+            .count();
+        let secondary = arrivals
+            .iter()
+            .filter(|at| **at >= SECONDARY_PEAK_START_MIN)
+            .count();
+        let quiet_gap = arrivals
+            .iter()
+            .filter(|at| **at >= PRIMARY_PEAK_END_MIN && **at < SECONDARY_PEAK_START_MIN)
+            .count();
+
+        assert_eq!(primary + secondary, arrivals.len());
+        assert_eq!(quiet_gap, 0, "no arrivals should land in the lull");
+        assert!(primary > 0 && secondary > 0);
+        assert!(
+            primary > secondary,
+            "primary burst should carry more patients ({primary} vs {secondary})"
+        );
+    }
+
+    #[test]
+    fn urgent_patients_jump_ahead_of_normal_queue() {
+        let mut world = demo_world(Strategy::Optimized, 3, 4);
+        let priorities = [
+            PatientPriority::Normal,
+            PatientPriority::Urgent,
+            PatientPriority::Normal,
+            PatientPriority::Urgent,
+        ];
+        for (idx, priority) in priorities.iter().enumerate() {
+            world.patients[idx].priority = *priority;
+        }
+        for idx in 0..4 {
+            world.enqueue(0, idx);
+        }
+        let order: Vec<usize> = world.rooms[0].queue.iter().copied().collect();
+        assert_eq!(order, vec![1, 3, 0, 2]);
+    }
+
+    #[test]
+    fn urgent_and_normal_wait_metrics_are_reported() {
+        let mut world = demo_world(Strategy::Optimized, 42, DEFAULT_PATIENT_COUNT);
+        let urgent = world
+            .patients
+            .iter()
+            .filter(|patient| patient.priority == PatientPriority::Urgent)
+            .count();
+        assert!(urgent > 0, "seeded run should include urgent patients");
+        world.run_to_completion();
+        let metrics = world.metrics();
+        assert!(metrics.avg_wait_urgent_min.is_finite());
+        assert!(metrics.p90_wait_urgent_min.is_finite());
+        assert!(metrics.avg_wait_normal_min.is_finite());
+        assert!(metrics.p90_wait_normal_min.is_finite());
+        assert!(
+            metrics.p90_wait_urgent_min <= metrics.p90_wait_normal_min
+                || metrics.avg_wait_urgent_min <= metrics.avg_wait_normal_min,
+            "urgent waits should not be worse than normal waits"
+        );
+    }
+
+    #[test]
+    fn downtime_holds_queue_and_is_visible_in_room_views() {
+        let mut world = demo_world(Strategy::Optimized, 11, 6);
+        world.rooms[0].queue.push_back(0);
+        world.handle_event(Event::RoomDowntimeStart {
+            room: 0,
+            duration_min: 15.0,
+        });
+        assert_eq!(world.rooms[0].down_until, Some(world.now_min() + 15.0));
+
+        world.dispatch_room(0);
+        assert_eq!(world.rooms[0].queue.len(), 1);
+        assert_eq!(world.rooms[0].pending_starts, 0);
+
+        let view = world
+            .room_views()
+            .into_iter()
+            .find(|view| view.id == world.scenario_rooms[0].id)
+            .expect("room view");
+        assert!(view.downtime_active);
+        assert!((view.downtime_remaining_min - 15.0).abs() < 1e-9);
+        assert!((view.est_wait_min - 15.0).abs() < 1e-9);
+
+        world.handle_event(Event::RoomDowntimeEnd { room: 0 });
+        assert!(world.rooms[0].down_until.is_none());
+        assert!(world.rooms[0].queue.is_empty());
+        assert_eq!(world.rooms[0].pending_starts, 1);
+    }
+
+    #[test]
+    fn downtime_lets_in_service_finish_but_holds_new_starts() {
+        let mut world = demo_world(Strategy::Optimized, 5, 4);
+        world.rooms[0].in_service.push(InService {
+            patient: 0,
+            started_at: 0.0,
+            ends_at: 10.0,
+        });
+        world.rooms[0].queue.push_back(1);
+        world.handle_event(Event::RoomDowntimeStart {
+            room: 0,
+            duration_min: 15.0,
+        });
+
+        // The running visit completes normally even while the room is offline.
+        world.handle_event(Event::ServiceEnd { patient: 0, room: 0 });
+        assert!(world.rooms[0].in_service.is_empty());
+        assert!(world.patients[0]
+            .visits
+            .iter()
+            .any(|visit| visit.room_id == "blood_test"));
+        assert_eq!(world.rooms[0].queue.len(), 1);
+
+        // The queued patient is only dispatched after the room reopens.
+        world.handle_event(Event::RoomDowntimeEnd { room: 0 });
+        assert!(world.rooms[0].queue.is_empty());
+        assert_eq!(world.rooms[0].pending_starts, 1);
     }
 }
