@@ -329,3 +329,92 @@ Seed 123:
 **Decision:** DISCARD — quy tắc vòng lặp yêu cầu "tốt hơn" rõ ràng; ở đây metric mục tiêu p90 đứng yên, avg là hòa hoán nhỏ giữa các seed, và cơ chế gần như không kích hoạt (0.026 switch/patient) dù thêm ~300 dòng code. Code reverted, cargo test 54/54. Bản ghi giữ làm tài liệu.
 
 **Bài học:** trong scenario hiện tại, patient kẹt queue hiếm khi do quyết định routing sai mà do contention tổng thể — re-routing chỉ giúp khi phòng downtime dài hoặc phép so sánh thay đổi lớn; cả hai hiếm. Nếu tăng downtime (15%→30%) hoặc thêm phòng hay hỏng, cơ chế này đáng thử lại.
+
+---
+
+## Round 6 — Remaining-tour rollout evaluation (chỉ Optimized)
+
+**Status:** ❌ DISCARDED (negative result — không W nào tốt hơn Round 4; không commit)
+
+**Aspect đề xuất:**
+- Round 4 chỉ lookahead 1 bước. Tổng quát hóa thành greedy rollout toàn phần tour còn lại: với mỗi candidate `r`, giả định `r` đã xong (`position = r`, `done ∪ {r}`), lặp chọn phòng rẻ nhất tiếp theo (`walk + est_wait decay theo thời điểm tới + est_service`) cho đến khi hết required rooms.
+- `rollout_cost(r)` = tổng cost tour còn lại **sau** `r` (không gồm cost tới `r`); `cost_total(r) = walk(current, r) + est_wait(r) + est_service(r) + W × rollout_cost(r)`, W sweep 0.3/0.4/0.5/0.6/0.7.
+- Rollout không tính lại capacity contention của người khác (chỉ decay est_wait theo thời điểm tới), deterministic, tối đa O(rooms²) mỗi quyết định (≤ 9 phòng → ~81 phép tính/lần; ~17k phép tính/sim).
+- Chỉ Optimized đổi; FixedOrder/ShortestQueue, `congestion.rs`, `sim.rs`, API/JSON, frontend giữ nguyên. Toàn bộ tie-break chain hiện có giữ nguyên.
+
+**Thiết kế:**
+- `rollout_plan` (`router.rs`): tạo `tour_done = done ∪ {r}`, `location = r`, `elapsed = walk_to(r) + wait_at(r) + est_service(r)`. Mỗi vòng lọc required chưa làm và eligible theo dependency, chọn min `walk(location, next) + future_wait(next, elapsed + walk) + est_service(next)`, cộng vào tổng, tăng `elapsed`, cập nhật `location`/`tour_done`. Trả `(total, path)` — path dùng cho test.
+- `rollout_cost` = phần total; production `total_cost` dùng `ROLLOUT_WEIGHT`. Lookahead 1 bước cũ giữ dưới `#[cfg(test)]` (`lookahead_cost`/`one_step_total_cost`) làm fallback đối chiếu.
+- Tie-band 25% và thứ tự walk gần → unblocks → downstream depth → en-route → queue → package position giữ nguyên, áp trên `cost_total` mới.
+- Sweep W: mỗi mức có fresh data dir → live seed 99 → compare 42/7/123, nên learned stats của từng mức là riêng của chính nó (đúng quy trình Round 3/4).
+
+**Bảng sweep W (Optimized, headless compare; TB = trung bình 3 seed):**
+
+| W | seed 42 avg/p90 | seed 7 avg/p90 | seed 123 avg/p90 | TB avg/p90 | walk TB |
+|---|---|---|---|---|---|
+| R4 1-step (0.5) | 63.92 / 75.89 | 72.80 / 126.89 | 75.92 / 121.81 | 70.88 / 108.20 | 11.85 |
+| **0.30** | **64.28 / 82.08** | **75.25 / 127.75** | **80.55 / 121.04** | **73.36 / 110.29** | **11.24** |
+| 0.40 | 64.88 / 86.18 | 74.31 / 124.92 | 80.78 / 127.95 | 73.32 / 113.02 | 10.94 |
+| 0.50 | 66.43 / 92.86 | 74.65 / 124.92 | 81.58 / 127.95 | 74.22 / 115.24 | 10.69 |
+| 0.60 | 66.96 / 86.18 | 74.80 / 124.92 | 81.58 / 127.95 | 74.45 / 113.02 | 10.59 |
+| 0.70 | 68.82 / 95.94 | 74.66 / 136.82 | 83.04 / 127.95 | 75.51 / 120.24 | 10.49 |
+
+- Chọn **W = 0.3** để verify cuối: p90 trung bình tốt nhất trong sweep (110.29), avg gần như đồng hạng với 0.4 (73.36 vs 73.32), thắng 0.4 ở 2/3 seed trên cả avg lẫn p90, và là mức thấp nhất còn giữ toàn bộ test cũ xanh.
+- Xu hướng rõ: W tăng → walk giảm đều (11.24 → 10.49) nhưng avg/p90 xấu đi. Rollout thực chất tối ưu hình học tour; càng tin vào nó càng bỏ qua congestion tương lai.
+- Lưu ý test: tại W ≥ 0.5, test cũ `clear_cost_difference_outranks_critical_path_depth` lật kỳ vọng. Rollout toàn tour cộng thêm phần tour chung vào cả hai phương án, làm khoảng cách tương đối co vào band 25% (ví dụ 47.5 vs 37.5 → 21%), nên tie-break critical-path chọn `a`. W = 0.3/0.4 pass 59/59.
+
+**Kết quả compare W=0.3 (verify chuẩn: fresh dir → live seed 99 → compare 42/7/123):**
+
+Seed 42:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized** | **64.28** | **2.94** | **82.08** | **11.62** |
+| FixedOrder | 77.02 | 5.91 | 130.21 | 13.45 |
+| ShortestQueue | 71.32 | 4.33 | 103.89 | 13.57 |
+
+Seed 7:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized** | **75.25** | **5.25** | **127.75** | **11.71** |
+| FixedOrder | 84.39 | 7.08 | 138.89 | 13.82 |
+| ShortestQueue | 77.82 | 5.56 | 139.75 | 13.10 |
+
+Seed 123:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized** | **80.55** | **9.13** | **121.04** | **10.39** |
+| FixedOrder | 86.44 | 10.17 | 145.23 | 12.73 |
+| ShortestQueue | 81.09 | 8.67 | 126.75 | 12.49 |
+
+Baselines khớp **từng số** với Round 4/3 ở cả 3 seed × 4 metric → physics, seed và routing của baselines không bị đụng.
+
+**Đánh giá vs Round 4 (Optimized):**
+
+| Seed | Δ avg_total | Δ avg_wait | Δ p90_total | Δ avg_walk |
+|---|---|---|---|---|
+| 42 | +0.36 (+0.6%) | +0.21 | +6.19 (+8.2%) | −0.43 |
+| 7 | +2.45 (+3.4%) | +0.82 | +0.86 (+0.7%) | −0.68 |
+| 123 | +4.63 (+6.1%) | +1.56 | −0.77 (−0.6%) | −0.71 |
+
+- Không đạt tiêu chí "tốt hơn avg_total **hoặc** p90_total mà không regression đáng kể": avg_total tệ hơn cả 3 seed (seed 7/123 vượt ngưỡng 1–2%), p90 chỉ tốt hơn 0.77 phút ở seed 123 nhưng tệ hơn +6.19 ở seed 42 và +0.86 ở seed 7.
+- avg_walk giảm đều 0.43–0.71 phút trên cả 3 seed: rollout thực sự kéo tour về gần nhau, nhưng đánh đổi bằng wait/tail. Nguyên nhân: rollout bỏ qua contention tương lai và decay est_wait theo thời điểm tới, nên các phòng đông "trong tương lai" bị định giá gần 0; W càng cao, quyết định càng bị kéo về tour ngắn thay vì né queue.
+- Live seed 99 (fresh dir, speed 5000→clamp 60), W=0.3: finished 409.81 phút, 52/52, 188 visits; 82.33 / 7.99 / 156.66 / 23.02 / **10.38** (avg_total/avg_wait/p90_total/p90_wait/avg_walk) vs Round 4 80.99 / 7.29 / 149.97 / 19.91 / 11.53 → chỉ walk tốt hơn.
+
+**Files changed:** `backend/src/engine/router.rs` (ROLLOUT_WEIGHT + `rollout_plan`/`rollout_cost`/`tour_total_cost`; lookahead cũ giữ cfg(test); 5 test mới), `docs/rounds/README.md`. Không đổi `congestion.rs`, `sim.rs`, `domain.rs`, `scenario.rs`, API, frontend. Không git commit/push; port 8080 không đụng.
+
+**Verify steps:**
+1. `cargo test`: **59/59 pass** (54 test cũ + 5 mới: rollout = 0 khi là phòng cuối và equivalence lookahead; rollout không chọn phòng chưa unlock; rollout ưu tiên phòng gần trong tour còn lại; equivalence khi chỉ còn 1 visit sau candidate; W=0 → immediate cost).
+2. `npm run build`: OK (chỉ warning chunk > 500 kB có từ trước).
+3. Fresh `MEDIROUTE_DATA_DIR=/tmp/mediroute-r6-test`, server riêng `PORT=8082`; live `{strategy:optimized, speed:5000, seed:99}` → finished 409.81 phút, 52/52, 188 visits.
+4. `POST /api/sim/compare` seed 42 → 7 → 123; ghi đủ 4 metric cho 3 strategies; xác nhận baselines khớp Round 4 từng số.
+5. Sweep W lặp lại đúng quy trình trên cho từng mức (fresh dir riêng `/tmp/mediroute-r6-w0*`).
+
+**Decision:** DISCARD (negative result) — không W nào vượt Round 4 trên avg_total hoặc p90_total mà không regression đáng kể; đây là negative result trung thực, không phải lỗi triển khai (rollout deterministic, dependency-valid, baselines nguyên vẹn). W=0.3 là mức tốt nhất của sweep nhưng vẫn kém R4 ở avg cả 3 seed và p90 2/3 seed. Code giữ ở working tree với W=0.3 để coordinator verify độc lập; đề xuất revert nếu không có hướng điều chỉnh khác (ví dụ mô phỏng contention trong rollout, hoặc chỉ dùng rollout khi queue thấp).
+
+
+**Verify độc lập (coordinator):** cargo test 59/59; lặp quy trình chuẩn (fresh dir → live seed 99 finished → compare seed 42): khớp chính xác (64.28/2.94/82.08/11.62). So với Round 4 seed 42: avg_total +0.36, p90_total +6.19 — regression rõ. Code reverted, cargo test 54/54.
+
+**Bài học:** rollout toàn tour tối ưu hình học (walk giảm đều 0.4–0.7 phút) nhưng est_wait decay về ~0 trong tương lai xa khiến nó bỏ qua contention tương lai — đẩy wait và tail lên. Lookahead 1 bước (R4) là điểm cân bằng tốt: đủ xa để tránh dead-end, đủ gần để est_wait còn ý nghĩa. Hướng này nên dừng trừ khi mô hình được contention tương lai tốt hơn.
