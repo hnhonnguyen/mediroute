@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::{walk_time, DependencyGraph, Room, RoomStats, ENTRANCE_ID, ENTRANCE_POSITION, WALK_TIME_MIN};
 use crate::scenario::{
     downtime_latest_start_min, ArrivalDemand, DOWNTIME_EARLIEST_START_MIN, DOWNTIME_PROBABILITY,
+    PRIMARY_PEAK_END_MIN, SECONDARY_PEAK_START_MIN,
 };
 
 use super::congestion;
@@ -25,6 +26,13 @@ const LOOKAHEAD_WEIGHT: f64 = 0.5;
 /// KAPPA = 0 reproduces Round 10 exactly. The five-seed sweep picked 0.5:
 /// higher values regressed both mean metrics and lost per-seed wins.
 const RISK_KAPPA: f64 = 0.5;
+
+/// Round 17 applies the demand-aware arrival wait from the last 20 minutes of
+/// the primary rush through the quiet gap (minutes 100-150), where measured
+/// over-prediction is largest: patients who end the peak have tours crossing
+/// the lull, and patients who start a tour in the lull face the secondary
+/// peak at minute 150.
+const POST_PEAK_WINDOW_START_MIN: f64 = PRIMARY_PEAK_END_MIN - 20.0;
 
 // Round 10 keeps outage risk as a late tie-break: the demo policy allows at
 // most one outage per room, so a room that has already started its outage is
@@ -219,6 +227,37 @@ impl RouteContext<'_> {
         }
     }
 
+    /// Round 17: in the end-of-peak and lull window the wait-from-now
+    /// projection systematically over-predicts the realized wait at the room:
+    /// the patient cannot queue while walking, so the walk time is priced
+    /// twice. The demand-aware wait at the arrival time (the same projection
+    /// the lookahead has used since Round 8) is far better calibrated when
+    /// arrivals stop. Keep the lower of the two estimates there: the demand
+    /// model can over-price the last minutes of the primary rush, so it is
+    /// only allowed to correct over-prediction, never to inflate.
+    fn first_step_wait(&self, room: &str) -> f64 {
+        let base = self.wait_at(room);
+        let Some(demand) = self.demand else {
+            return base;
+        };
+        if self.now_min < POST_PEAK_WINDOW_START_MIN
+            || self.now_min >= SECONDARY_PEAK_START_MIN
+            || self.load(room).downtime_remaining_min > 0.0
+        {
+            return base;
+        }
+        let arrival_wait = congestion::future_wait_min(
+            &self.load(room),
+            self.est_service(room),
+            self.capacity(room),
+            Some(demand),
+            room,
+            self.now_min,
+            self.walk_to(room),
+        );
+        base.min(arrival_wait)
+    }
+
     /// Probability that this room's one allowed outage is still ahead, given
     /// that no outage has been observed yet. Uses only the observed episode
     /// history and the published policy (15% chance, start uniform in
@@ -302,7 +341,7 @@ impl RouteContext<'_> {
     /// half-weighted follow-up.
     fn mean_cost(&self, room: &str, required: &HashSet<&str>, done: &HashSet<&str>) -> f64 {
         self.walk_to(room)
-            + self.wait_at(room)
+            + self.first_step_wait(room)
             + self.est_service(room)
             + LOOKAHEAD_WEIGHT * self.lookahead_cost(room, required, done)
     }
@@ -1384,5 +1423,188 @@ mod tests {
             ctx.next_room(Strategy::ShortestQueue, &required, &[]),
             Some("calm".to_string())
         );
+    }
+
+    #[test]
+    fn first_step_wait_uses_the_demand_aware_arrival_wait_in_post_peak() {
+        // Two queued patients at a one-station room project a 20-minute wait
+        // from now, but the patient spends 3.5 minutes walking and the lull
+        // adds no future arrivals, so the wait at the room is 16.5 minutes.
+        let demand = ArrivalDemand::from_scenario(&demo_scenario(), 52);
+        let rooms = vec![room_at("a", 10.0, 1, (10.0, 0.0))];
+        let graph = graph(&rooms, &[]);
+        let stats = stats(&rooms, &[]);
+        let room_loads = loads(&[("a", 2, 0, 0, 0)]);
+        let ctx = RouteContext {
+            rooms: &rooms,
+            graph: &graph,
+            stats: &stats,
+            loads: &room_loads,
+            current_location: ENTRANCE_ID,
+            demand: Some(&demand),
+            now_min: 125.0,
+        };
+
+        assert!((ctx.wait_at("a") - 20.0).abs() < 1e-9);
+        assert!((ctx.walk_to("a") - 3.5).abs() < 1e-9);
+        assert!((ctx.first_step_wait("a") - 16.5).abs() < 1e-9);
+        assert!((ctx.first_step_wait("a") - ctx.future_wait("a", 3.5)).abs() < 1e-9);
+
+        let required = vec!["a".to_string()];
+        let required_set: HashSet<&str> = required.iter().map(String::as_str).collect();
+        let expected = 3.5 + 16.5 + 10.0;
+        assert!((ctx.mean_cost("a", &required_set, &HashSet::new()) - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn first_step_wait_keeps_the_wait_from_now_outside_the_post_peak_window() {
+        let demand = ArrivalDemand::from_scenario(&demo_scenario(), 52);
+        let rooms = vec![room_at("a", 10.0, 1, (10.0, 0.0))];
+        let graph = graph(&rooms, &[]);
+        let stats = stats(&rooms, &[]);
+        let room_loads = loads(&[("a", 2, 0, 0, 0)]);
+        for now in [50.0, 99.9, 150.0, 180.0] {
+            let ctx = RouteContext {
+                rooms: &rooms,
+                graph: &graph,
+                stats: &stats,
+                loads: &room_loads,
+                current_location: ENTRANCE_ID,
+                demand: Some(&demand),
+                now_min: now,
+            };
+            assert_eq!(
+                ctx.first_step_wait("a"),
+                ctx.wait_at("a"),
+                "now = {now} is outside the post-peak window"
+            );
+        }
+        // Without the scenario demand model the pricing is unchanged too.
+        let ctx = RouteContext {
+            rooms: &rooms,
+            graph: &graph,
+            stats: &stats,
+            loads: &room_loads,
+            current_location: ENTRANCE_ID,
+            demand: None,
+            now_min: 125.0,
+        };
+        assert_eq!(ctx.first_step_wait("a"), ctx.wait_at("a"));
+    }
+
+    #[test]
+    fn first_step_wait_never_inflates_over_the_wait_from_now() {
+        // Future arrivals during the walk would give an empty hot room a
+        // positive wait; the round only corrects over-prediction.
+        let demand = ArrivalDemand::from_scenario(&demo_scenario(), 52);
+        let rooms = vec![room_at("blood_test", 10.0, 1, (10.0, 0.0))];
+        let graph = graph(&rooms, &[]);
+        let stats = stats(&rooms, &[]);
+        let room_loads = HashMap::new();
+        let ctx = RouteContext {
+            rooms: &rooms,
+            graph: &graph,
+            stats: &stats,
+            loads: &room_loads,
+            current_location: ENTRANCE_ID,
+            demand: Some(&demand),
+            now_min: 110.0,
+        };
+        assert!(ctx.future_wait("blood_test", 3.5) > 0.0);
+        assert_eq!(ctx.first_step_wait("blood_test"), 0.0);
+    }
+
+    #[test]
+    fn peak_backlogged_room_projected_wait_falls_as_the_primary_peak_ends() {
+        // Orthopedics runs one station and its peak arrival rate x service
+        // time exceeds capacity, so its queue is still growing at minute 118;
+        // only the last two rush minutes add future load, less than the walk
+        // window at minute 100. The committed-load wait itself is unchanged.
+        let demand = ArrivalDemand::from_scenario(&demo_scenario(), 52);
+        let rooms = vec![room_at("orthopedics", 16.0, 1, (8.0, 16.0))];
+        let graph = graph(&rooms, &[]);
+        let stats = stats(&rooms, &[]);
+        let room_loads = loads(&[("orthopedics", 2, 0, 0, 0)]);
+        let context_at = |now: f64| RouteContext {
+            rooms: &rooms,
+            graph: &graph,
+            stats: &stats,
+            loads: &room_loads,
+            current_location: ENTRANCE_ID,
+            demand: Some(&demand),
+            now_min: now,
+        };
+
+        let early = context_at(100.0);
+        let end_of_peak = context_at(118.0);
+        let early_wait = early.first_step_wait("orthopedics");
+        let end_wait = end_of_peak.first_step_wait("orthopedics");
+        assert!(end_wait < early_wait, "{end_wait} vs {early_wait}");
+        assert!(early_wait <= early.wait_at("orthopedics"));
+        assert_eq!(
+            early.wait_at("orthopedics"),
+            end_of_peak.wait_at("orthopedics"),
+            "the committed-load wait itself is unchanged; only future demand differs"
+        );
+    }
+
+    #[test]
+    fn post_peak_pricing_does_not_change_baseline_choices() {
+        let demand = ArrivalDemand::from_scenario(&demo_scenario(), 52);
+        let rooms = vec![
+            room_at("a", 10.0, 1, (10.0, 0.0)),
+            room_at("b", 10.0, 1, (10.0, 0.0)),
+        ];
+        let graph = graph(&rooms, &[]);
+        let stats = stats(&rooms, &[]);
+        let room_loads = loads(&[("a", 2, 0, 0, 0), ("b", 0, 0, 0, 0)]);
+        let ctx = RouteContext {
+            rooms: &rooms,
+            graph: &graph,
+            stats: &stats,
+            loads: &room_loads,
+            current_location: ENTRANCE_ID,
+            demand: Some(&demand),
+            now_min: 125.0,
+        };
+        let required = vec!["a".to_string(), "b".to_string()];
+
+        assert_eq!(
+            ctx.next_room(Strategy::FixedOrder, &required, &[]),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            ctx.next_room(Strategy::ShortestQueue, &required, &[]),
+            Some("b".to_string())
+        );
+    }
+
+    #[test]
+    fn post_peak_pricing_leaves_the_round_sixteen_sigma_horizon_unchanged() {
+        let demand = ArrivalDemand::from_scenario(&demo_scenario(), 52);
+        let rooms = vec![room_at("a", 10.0, 1, (10.0, 0.0))];
+        let graph = graph(&rooms, &[]);
+        let stats = stats(&rooms, &[]);
+        let room_loads = loads(&[("a", 2, 0, 0, 0)]);
+        let ctx = RouteContext {
+            rooms: &rooms,
+            graph: &graph,
+            stats: &stats,
+            loads: &room_loads,
+            current_location: ENTRANCE_ID,
+            demand: Some(&demand),
+            now_min: 125.0,
+        };
+        let horizon = ctx.walk_to("a") + ctx.wait_at("a");
+        let expected = congestion::wait_sigma_min(
+            &ctx.load("a"),
+            ctx.est_service("a"),
+            ctx.capacity("a"),
+            Some(&demand),
+            "a",
+            125.0,
+            horizon,
+        );
+        assert_eq!(ctx.wait_sigma("a"), expected);
     }
 }
