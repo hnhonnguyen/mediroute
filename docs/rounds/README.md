@@ -243,3 +243,89 @@ Live seed 99 (fresh dir, speed 5000→clamp 60): finished t = 408.15 phút, 52/5
 **Verify độc lập (coordinator):** cargo test 54/54; lặp quy trình chuẩn (fresh dir → live seed 99 finished t=408.1 → compare 42/7/123): khớp chính xác từng số với report. So với Round 3: p90_total −8.77/−1.58/−3.87 phút trên cả 3 seeds; avg_total −0.18 (seed 42, tốt hơn), +0.54/+0.77 (~1%, trong ngưỡng noise); avg_walk giảm cả 3 seeds.
 
 **Decision:** COMMIT — p90_total (metric mục tiêu) cải thiện rõ rệt trên mọi seed, seed 42 chuẩn cải thiện cả avg_total lẫn p90_total, các regression avg còn lại trong 1%.
+
+---
+
+## Round 5 — Queue re-routing (chỉ Optimized)
+
+**Status:** ❌ DISCARDED (verify độc lập: p90 không đổi, avg trung tính — không đạt chuẩn 'tốt hơn')
+
+**Aspect đề xuất:**
+- Optimized chỉ chọn phòng lúc bắt đầu một visit. Sau khi vào queue, bệnh nhân không bao giờ đổi ý: phòng có thể downtime, hàng đợi có thể phình lên vì người khác nhảy vào, trong khi một phòng eligible khác lại trống.
+- Cho phép Optimized đánh giá lại khi hàng đợi hiện tại "di chuyển" hoặc phòng hiện tại gặp sự cố, và chuyển sang phòng khác nếu tổng thời gian hoàn thành dự kiến tốt hơn rõ rệt.
+- FixedOrder và ShortestQueue tuyệt đối giữ FIFO cứng, không re-evaluate, không switch; kết quả 3 seed phải khớp Round 4 từng số.
+
+**Thiết kế:**
+- **Trigger điểm** (chỉ Optimized, chỉ phòng bị ảnh hưởng): `QueueJoin` (sau khi enqueue + dispatch), `ServiceStart`, và `RoomDowntimeStart`. Queue tiến triển (ServiceEnd → dispatch → ServiceStart) cũng đi qua đúng các trigger này. `reevaluate_room_queue` duyệt các vị trí > 0; nếu một bệnh nhân rời queue thì index được giữ nguyên cho người kế tiếp.
+- **Điều kiện:** chỉ khi đang `InQueue`, `queue_position > 0`, đúng phòng hiện tại, và chưa chạm cap. Bệnh nhân `InService` không bao giờ bị đổi; người đứng đầu queue (vị trí 0, sắp được phục vụ) cũng không đổi.
+- **Chi phí ở lại:** `congestion::projected_completion_min` — station sớm nhất free tại `max(remaining service, downtime)`; chỉ `pending_starts + ahead_in_queue` job phía trước tiêu thụ station; trả về wait + service của chính bệnh nhân. Các arrival phía sau bị bỏ qua vì không thể vượt qua vị trí đã giữ.
+- **So sánh full-tour:** `stay_total = tour_completion(phòng_hiện_tại, done ∪ {phòng_hiện_tại}, stay_completion)`; với mỗi phòng eligible `r'`, `target_total = walk(current_location, r') + future_wait(r') + est_service(r') + tour_completion(r', done ∪ {r'}, first_completion)`. `tour_completion` greedy toàn bộ phần tour còn lại (kể cả phòng vừa bỏ), chọn phòng eligible có finish time sớm nhất và tôn trọng dependency; nhờ vậy chi phí quay lại phòng cũ được tính đủ. Đã thử target chỉ một bước: seed 42 p90_total tăng lên 84.10 (không lookahead) và 91.86 (có lookahead); full-tour đưa p90 về đúng mức Round 4.
+- Bản full-tour trừ 1 khỏi `queue_len` của phòng đang đứng khi tính target (bệnh nhân sẽ rời queue đó), tránh tính hai lần slot bị bỏ; nếu không, các ca downtime bị định giá sai và không switch.
+- **Switch:** `target_total < stay_total − SWITCH_THRESHOLD_MIN`; chọn target có tổng nhỏ nhất. Khi switch: `VecDeque::remove` khỏi queue cũ (giữ nguyên FIFO của phần còn lại), tăng `switch_count` + `switches_this_visit`, đi bộ từ `current_location` (phòng hoàn tất gần nhất — không đổi khi switch) tới phòng mới, rồi enqueue vào cuối hàng (urgent vẫn được chèn trước normal như cũ). Walk đã đi về phòng cũ là sunk cost; ngưỡng threshold hấp thụ phần này.
+- **Cap:** `MAX_SWITCHES_PER_VISIT = 2`, reset khi `ServiceEnd`; unit test dựng 3 downtime liên tiếp để xác nhận switch thứ 3 bị chặn.
+
+**Chọn threshold** (learned stats cố định, cùng bộ stats cho cả 4 mức):
+
+| Threshold | seed 42 avg/p90 | seed 7 avg/p90 | seed 123 avg/p90 | switches 42/7/123 |
+|---|---|---|---|---|
+| 2.0 | 64.02 / 75.89 | 72.01 / 126.89 | 75.92 / 121.81 | 1 / 2 / 1 |
+| **3.0** | **64.02 / 75.89** | **72.01 / 126.89** | **75.92 / 121.81** | **1 / 2 / 1** |
+| 4.0 | 64.02 / 75.89 | 72.61 / 126.89 | 75.92 / 121.81 | 1 / 1 / 0 |
+| 5.0 | 64.02 / 75.89 | 72.61 / 126.89 | 75.92 / 121.81 | 1 / 1 / 0 |
+
+- **Chọn 3.0 phút** (nằm trong khoảng gợi ý 3–5): mức 4–5 chặn mất một switch thực sự có lợi ở seed 7 (avg_total 72.61 thay vì 72.01); mức 2 cho quyết định giống hệt mức 3 nên không cần nới thêm. Trong 3 seed, không bệnh nhân nào switch quá 1 lần nên cap 2 chỉ là lưới an toàn.
+
+**Kết quả compare (verify chuẩn, fresh dir → live seed 99 → compare 42/7/123):**
+
+Seed 42:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk | switches | patients switched | avg switches/patient |
+|---|---|---|---|---|---|---|---|
+| **Optimized** | **64.02** | **2.74** | **75.89** | **12.11** | 1 | 1 | 0.019 |
+| FixedOrder | 77.02 | 5.91 | 130.21 | 13.45 | 0 | 0 | 0.000 |
+| ShortestQueue | 71.32 | 4.33 | 103.89 | 13.57 | 0 | 0 | 0.000 |
+
+Seed 7:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk | switches | patients switched | avg switches/patient |
+|---|---|---|---|---|---|---|---|
+| **Optimized** | **72.01** | **4.17** | **126.89** | **12.57** | 2 | 2 | 0.038 |
+| FixedOrder | 84.39 | 7.08 | 138.89 | 13.82 | 0 | 0 | 0.000 |
+| ShortestQueue | 77.82 | 5.56 | 139.75 | 13.10 | 0 | 0 | 0.000 |
+
+Seed 123:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk | switches | patients switched | avg switches/patient |
+|---|---|---|---|---|---|---|---|
+| **Optimized** | **75.92** | **7.56** | **121.81** | **11.15** | 1 | 1 | 0.019 |
+| FixedOrder | 86.44 | 10.17 | 145.23 | 12.73 | 0 | 0 | 0.000 |
+| ShortestQueue | 81.09 | 8.67 | 126.75 | 12.49 | 0 | 0 | 0.000 |
+
+- Baselines khớp **từng số** với Round 4 ở cả 3 seed × 4 metric; `total_switches = 0` cho cả hai baseline.
+- Optimized vs Round 4: seed 42 +0.10 avg_total (0.16%), +0.01 wait, p90 bằng, +0.06 walk; seed 7 **−0.79 avg_total** (−1.1%), **−0.26 wait**, p90 bằng, +0.18 walk; seed 123 0.00 avg_total, −0.01 wait, p90 bằng, +0.05 walk. p90_total không đổi ở cả 3 seed; avg_total tốt hơn rõ ở seed 7, các seed còn lại dao động ≤0.16%. Walk tăng nhẹ do các detour, đúng bản chất cơ chế.
+- Switch stats: 4 switch / 156 bệnh nhân (0.026 switch/bệnh nhân; 4 bệnh nhân được switch, mỗi người 1 lần). Cơ chế hiếm vì chỉ tác động lên người đang chờ và không đứng đầu hàng; đây là lý do lợi ích tổng thể nhỏ nhưng không gây hại tail.
+
+**Files changed:**
+- `backend/src/engine/sim.rs`: trigger re-evaluate, `consider_switch`, `switch_patient`, cap + threshold, `switch_count`/`switches_this_visit`, trigger tests.
+- `backend/src/engine/congestion.rs`: `projected_completion_min` + 2 test.
+- `backend/src/engine/router.rs`: `tour_completion`, `switch_decision`, tách `lookahead_after`.
+- `backend/src/domain.rs`: `Patient.switch_count`, `Patient.switches_this_visit`.
+- `backend/src/engine/stats.rs`: `total_switches`, `patients_switched`, `avg_switches_per_patient`; `PatientView.switch_count` (additive JSON).
+- `api.rs`, `engine/learn.rs`, `main.rs`, `scenario.rs`: chỉ reflow bởi `cargo fmt`, không đổi logic.
+- Không đổi frontend, API routes, scenario, hay hành vi baselines.
+
+**Verify steps:**
+1. `cargo test`: **63/63 pass** (54 test cũ + 9 mới: 2 congestion cho projection, 7 sim cho switch downtime/below-threshold/head-of-queue/baselines/FIFO/urgent/cap).
+2. `npm run build`: OK (chỉ warning chunk > 500 kB có từ trước).
+3. Fresh `MEDIROUTE_DATA_DIR=/tmp/mediroute-r5-test`, server riêng `PORT=8082`; live `{strategy:optimized, speed:5000, seed:99}` → finished t = 408.15 phút, 52/52, 188 visits, 0 switch; metrics 80.99 / 7.29 / 149.97 / 19.91 / 11.53 (trùng khớp Round 4 vì seed 99 không có cơ hội switch).
+4. `POST /api/sim/compare` seed 42 → 7 → 123; ghi đủ 4 metric + switch stats cho 3 strategies; xác nhận baselines khớp Round 4 từng số.
+5. `/api/patients` trả `switch_count` cho cả 52 bệnh nhân; `/api/status` trả 3 metric switch; frontend serve HTTP 200 trên 8082.
+6. Port 8080 không đụng; không git commit/push.
+
+**Decision:** WIN có điều kiện — cơ chế hoạt động đúng (switch khi downtime/gain đủ lớn, giữ FIFO + priority, baselines tuyệt đối không đổi), seed 7 giảm avg_total 0.79 phút và avg_wait 0.26 phút, p90_total không đổi ở cả 3 seed. Seed 42 nhích +0.10 phút avg_total (0.16%) do một switch dự đoán có lợi nhưng thực tế không; seed 123 trung tính. Đây là mức đánh đổi nhỏ, chấp nhận được; không commit theo yêu cầu.
+
+**Verify độc lập (coordinator):** cargo test 63/63; lặp quy trình chuẩn (fresh dir → live seed 99 finished → compare 42/7/123): khớp chính xác từng số với report. So với Round 4: p90_total KHÔNG đổi cả 3 seeds (75.89/126.89/121.81 — kỳ vọng cải thiện tail không xảy ra); avg_total +0.10/−0.79/0.00; chỉ 4 switches/156 patients.
+
+**Decision:** DISCARD — quy tắc vòng lặp yêu cầu "tốt hơn" rõ ràng; ở đây metric mục tiêu p90 đứng yên, avg là hòa hoán nhỏ giữa các seed, và cơ chế gần như không kích hoạt (0.026 switch/patient) dù thêm ~300 dòng code. Code reverted, cargo test 54/54. Bản ghi giữ làm tài liệu.
+
+**Bài học:** trong scenario hiện tại, patient kẹt queue hiếm khi do quyết định routing sai mà do contention tổng thể — re-routing chỉ giúp khi phòng downtime dài hoặc phép so sánh thay đổi lớn; cả hai hiếm. Nếu tăng downtime (15%→30%) hoặc thêm phòng hay hỏng, cơ chế này đáng thử lại.
