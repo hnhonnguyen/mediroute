@@ -418,3 +418,104 @@ Baselines khớp **từng số** với Round 4/3 ở cả 3 seed × 4 metric →
 **Verify độc lập (coordinator):** cargo test 59/59; lặp quy trình chuẩn (fresh dir → live seed 99 finished → compare seed 42): khớp chính xác (64.28/2.94/82.08/11.62). So với Round 4 seed 42: avg_total +0.36, p90_total +6.19 — regression rõ. Code reverted, cargo test 54/54.
 
 **Bài học:** rollout toàn tour tối ưu hình học (walk giảm đều 0.4–0.7 phút) nhưng est_wait decay về ~0 trong tương lai xa khiến nó bỏ qua contention tương lai — đẩy wait và tail lên. Lookahead 1 bước (R4) là điểm cân bằng tốt: đủ xa để tránh dead-end, đủ gần để est_wait còn ý nghĩa. Hướng này nên dừng trừ khi mô hình được contention tương lai tốt hơn.
+
+---
+
+## Round 7 — Priority-aware wait estimation (chỉ Optimized)
+
+**Status:** ❌ DISCARDED (negative result — avg_total và p90_total đều tệ hơn Round 4 ở cả 3 seed; không commit)
+
+**Aspect đề xuất:**
+- `est_wait` hiện coi mọi patient như nhau (gần-FIFO), nhưng:
+  - (a) urgent đang quyết định sẽ nhảy trước mọi normal đang chờ → wait thật của họ chỉ gồm in-service remaining + urgent phía trước, không phải toàn bộ queue. Router ước lượng quá cao cho urgent nên họ có thể né phòng thực ra tốt cho mình.
+  - (b) normal sẽ bị urgent arrivals (tương lai gần) nhảy trước → wait thật cao hơn `est_wait` hiện tại một chút; anti-herding đã đếm arrivals nhưng chưa tính hiệu ứng nhảy queue.
+- Tách `est_wait` theo class của patient đang quyết định, dùng cho cả cost hiện tại lẫn lookahead 1 bước. Không đổi priority queue trong `sim.rs`, baselines, API/JSON, frontend, learning.
+
+**Thiết kế:**
+- `RoomLoad` thêm (additive, default 0): `urgent_queue_len`, `urgent_en_route`, `urgent_arrival_rate_per_min`. `sim.rs` đếm urgent trong queue/en-route và ghi timestamp mỗi lần urgent enqueue (`urgent_join_times`); cơ chế chèn priority không đổi.
+- `congestion::est_wait_urgent_min`: `projected_wait` với jobs = `pending_starts` (đã được dequeue trước khi newcomer kịp join, nên cản mọi class) + `urgent_queue_len` + `urgent_en_route`. In-service remaining của mọi class vẫn cản vì visit không bị gián đoạn; downtime vẫn cộng. Normal queue/en-route bị bỏ qua; likely arrivals cũng bỏ qua (giữ đơn giản, có thể underestimate khi nhiều urgent cùng tới).
+- `congestion::est_wait_normal_min`: lấy nguyên `est_wait_min` (FIFO + likely arrivals) làm base, cộng **expected urgent jumpers**. λ của từng phòng = số urgent enqueue trong 30 phút sim gần nhất / 30 (`URGENT_RATE_WINDOW_MIN`; đầu run λ tự nhiên thấp). `jumpers = ceil(λ × base_wait)`; cộng `jumpers` vào extra jobs của projected wait. Kết quả luôn ≥ generic (test xác nhận).
+- `router.rs`: `next_room` nhận `PatientPriority`; `wait_at`/`future_wait`/`lookahead_cost`/`total_cost` dùng đúng class, kể cả phòng kế trong lookahead 1 bước. Baselines nhận tham số nhưng không đọc (tests xác nhận lựa chọn y hệt).
+- `RoomView` thêm `est_wait_urgent_min`, `est_wait_normal_min` (additive JSON); không thêm metric mới, frontend không đổi.
+- File changed: `backend/src/engine/congestion.rs`, `router.rs`, `sim.rs` (instrumentation load + RoomView); `docs/rounds/README.md`. Không đổi `stats.rs`, `api.rs`, `scenario.rs`, `domain.rs`, frontend.
+
+**Tests:** `cargo test` **63/63 pass** (54 cũ + 9 mới: 6 congestion — urgent bỏ normal queue/en-route, urgent chỉ đếm urgent competitors, normal cộng jumpers, normal ≥ generic, idle/downtime; 2 router — urgent chọn phòng normal né, baselines bỏ qua priority; 1 sim — split queue/en-route + λ). `npm run build` OK (chỉ warning chunk > 500 kB có từ trước).
+
+**Kết quả compare (verify chuẩn: fresh `/tmp/mediroute-r7-test` → live seed 99 speed 5000→clamp 60 → compare 42/7/123; 8 metric):**
+
+Seed 42:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk | avg_wait_urgent | p90_wait_urgent | avg_wait_normal | p90_wait_normal |
+|---|---|---|---|---|---|---|---|---|
+| **Optimized** | **65.94** | **3.19** | **94.43** | **12.38** | **1.02** | **4.16** | **3.52** | **11.53** |
+| FixedOrder | 77.02 | 5.91 | 130.21 | 13.45 | 1.73 | 6.39 | 6.54 | 23.41 |
+| ShortestQueue | 71.32 | 4.33 | 103.89 | 13.57 | 1.88 | 6.40 | 4.70 | 13.80 |
+
+Seed 7:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk | avg_wait_urgent | p90_wait_urgent | avg_wait_normal | p90_wait_normal |
+|---|---|---|---|---|---|---|---|---|
+| **Optimized** | **73.44** | **4.60** | **128.65** | **12.39** | **1.59** | **4.27** | **4.90** | **17.27** |
+| FixedOrder | 84.39 | 7.08 | 138.89 | 13.82 | 2.18 | 7.43 | 7.57 | 23.16 |
+| ShortestQueue | 77.82 | 5.56 | 139.75 | 13.10 | 1.76 | 6.17 | 5.94 | 16.57 |
+
+Seed 123:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk | avg_wait_urgent | p90_wait_urgent | avg_wait_normal | p90_wait_normal |
+|---|---|---|---|---|---|---|---|---|
+| **Optimized** | **79.27** | **8.47** | **140.25** | **11.36** | **3.00** | **7.79** | **9.05** | **24.48** |
+| FixedOrder | 86.44 | 10.17 | 145.23 | 12.73 | 1.94 | 6.85 | 11.04 | 23.38 |
+| ShortestQueue | 81.09 | 8.67 | 126.75 | 12.49 | 3.76 | 10.69 | 9.19 | 24.95 |
+
+Baselines khớp **từng số** với Round 4 ở cả 3 seed × 4 metric (77.02/5.91/130.21/13.45; 71.32/4.33/103.89/13.57; 84.39/7.08/138.89/13.82; 77.82/5.56/139.75/13.10; 86.44/10.17/145.23/12.73; 81.09/8.67/126.75/12.49) và cả split urgent/normal.
+
+**Đo split Round 4 từ HEAD** (cùng quy trình, worktree sạch tại commit R4):
+
+| Seed | avg_wait_urgent | p90_wait_urgent | avg_wait_normal | p90_wait_normal |
+|---|---|---|---|---|
+| 42 | 1.38 | 6.55 | 2.93 | 10.07 |
+| 7 | 1.17 | 3.90 | 4.75 | 15.82 |
+| 123 | 2.52 | 8.17 | 8.10 | 24.62 |
+
+**Đánh giá vs Round 4 (Optimized):**
+
+| Seed | Δ avg_total | Δ avg_wait | Δ p90_total | Δ avg_walk | Δ urg avg/p90 | Δ norm avg/p90 |
+|---|---|---|---|---|---|---|
+| 42 | +2.02 (+3.2%) | +0.46 | **+18.54 (+24.4%)** | +0.33 | −0.36 / **−2.39** | +0.59 / +1.46 |
+| 7 | +0.64 (+0.9%) | +0.17 | +1.76 (+1.4%) | 0.00 | +0.42 / +0.37 | +0.15 / +1.45 |
+| 123 | +3.35 (+4.4%) | +0.90 | **+18.44 (+15.1%)** | +0.26 | +0.48 / −0.38 | +0.95 / −0.14 |
+
+- Không đạt tiêu chí "tốt hơn avg_total **hoặc** p90_total mà không regression đáng kể": cả 3 seed đều tệ hơn avg_total; p90_total tệ hơn ở cả 3 (2 seed tệ hơn ~15–24%). Chỉ urgent p90 seed 42 cải thiện rõ (−2.39) nhưng đánh đổi bằng normal và tổng.
+- Live seed 99: finished 408.15 phút, 52/52, 188 visits; **81.03 / 7.35 / 143.03 / 19.91 / 11.37**, urgent 4.18/8.22, normal 7.59/20.78 (R4: 80.99/7.29/149.97/19.91/11.53; split đo lại: urgent 4.20/9.90, normal 7.52/20.78). Live p90_total giảm 6.94 nhưng compare 3 seed lại tệ hơn — seed 99 là ngoại lệ có lợi, không phải xu hướng.
+
+**Chẩn đoán (các biến thể, mỗi mức fresh dir + live seed 99 + compare 42/7/123):**
+
+| Variant | seed 42 avg/p90 | seed 7 avg/p90 | seed 123 avg/p90 |
+|---|---|---|---|
+| R4 (tham chiếu) | 63.92 / 75.89 | 72.80 / 126.89 | 75.92 / 121.81 |
+| urgent-only (normal dùng generic) | 63.79 / 83.69 | 73.06 / 128.20 | 75.92 / 121.81 |
+| normal-only (urgent dùng generic) | 66.32 / 94.43 | 73.18 / 128.40 | 79.27 / 140.25 |
+| full + jumpers floor | 64.02 / 92.73 | 73.06 / 128.20 | 75.92 / 121.81 |
+| full + jumpers ceil (final) | 65.94 / 94.43 | 73.44 / 128.65 | 79.27 / 140.25 |
+
+- Chạy R7 router với **stats học được của R4** cho kết quả giống hệt R7 stats (65.94/3.19/94.43/12.38; 73.44/4.60/128.65/12.39; 79.27/8.47/140.25/11.36) → regression thuần do routing, không phải feedback của learning.
+- Urgent-only (bỏ term jumpers) gần như hòa R4 về avg nhưng p90 vẫn tệ hơn 2 seed; normal-only một mình tái hiện gần đủ mức p90 tệ (94.43 / 140.25) → **term normal jumpers là nguồn regression lớn nhất**, còn class-aware urgent tự nó cũng không cải thiện tổng.
+- Nguyên nhân: (a) khi urgent bỏ qua normal queue, urgent lao vào các phòng nhiều normal — đúng là urgent được phục vụ nhanh hơn nhưng normal bị đẩy chậm; ước lượng cũ (đếm cả normal queue) vô tình đóng vai trò san tải và có lợi hơn cho tổng. Tiền đề "urgent né phòng thực ra tốt cho họ" không đúng trong scenario này (urgent-only làm urgent p90 seed 42 tăng 1.71 vs 1.38). (b) term jumpers (ceil) phạt mọi phòng có urgent history thêm 1–2 full service (~10–30 phút), đủ để lật nhiều quyết định normal sang tour khác; seed 42 điển hình: 5 bệnh nhân General Checkup kết tour tại ENT với wait 20–30 phút (R4: 7–11) → p90_total 94.43. Floor làm normal p90 gần R4 hơn nhưng vẫn không cứu được tail.
+- Không có over-bias rõ về walk: seed 42/7 walk tăng nhẹ (+0.33/0.00), seed 123 +0.26.
+
+**Verify steps:**
+1. `cargo test`: 63/63 pass; `npm run build`: OK.
+2. Fresh `MEDIROUTE_DATA_DIR=/tmp/mediroute-r7-test`, server riêng `PORT=8082`; live `{strategy:optimized, speed:5000, seed:99}` → finished t = 408.15 phút, 52/52, 188 visits.
+3. `POST /api/sim/compare` seed 42 → 7 → 123; ghi đủ 8 metric cho 3 strategies; baselines khớp R4 từng số; `/api/rooms` trả thêm `est_wait_urgent_min`/`est_wait_normal_min`.
+4. Biến thể: lặp quy trình với fresh dir riêng cho urgent-only, normal-only, full-floor; đo R4 split bằng worktree sạch tại HEAD.
+5. Port 8080 không đụng; không git commit/push.
+
+**Decision:** DISCARD (negative result) — priority-aware wait estimation không cải thiện tổng thể: avg_total tệ hơn cả 3 seed, p90_total tệ hơn 1.4–24.4%, chỉ urgent p90 seed 42 tốt hơn. Code giữ ở working tree (uncommitted) để coordinator verify độc lập; đề xuất revert nếu không có hướng điều chỉnh khác (ví dụ discount một phần normal queue thay vì bỏ hẳn, hoặc chỉ áp dụng term jumpers khi contention thực sự cao).
+
+**Bài học:** trong scenario này ưu tiên là cơ chế queue, không phải tín hiệu routing. Bỏ qua normal queue khiến urgent herding vào phòng đông và chuyển chi phí sang normal; ước lượng "sai" cũ lại là một dạng điều tiết tải có lợi. Muốn khai thác priority trong routing cần mô hình hóa **chi phí ngoại ứng lên normal** (không chỉ wait của urgents), thay vì chỉ sửa wait estimate của từng class.
+
+**Verify độc lập (coordinator):** cargo test 63/63; lặp quy trình chuẩn (fresh dir → live seed 99 finished → compare seed 42): khớp chính xác (65.94/94.43 — regression vs R4 63.92/75.89). Code reverted, cargo test 54/54.
+
+**Decision:** DISCARD — p90_total regression +18.54 (seed 42) / +18.44 (seed 123). Chẩn đoán của agent xác nhận: urgent-only estimate gần hòa nhưng normal-only tái hiện phần lớn regression; bỏ normal queue khỏi ước lượng urgent khiến urgent herding vào phòng đông, chuyển chi phí sang normal (5 patients General Checkup seed 42 kết tour tại ENT với wait 20–30 min).
+
+**Bài học:** tách ước lượng wait theo class chỉ an toàn khi lượng urgent đủ nhỏ để effect bậc hai; ở đây ~10% urgent đủ để sai lệch ước lượng normal (jumpers) bẻ cong tour của 90% patients. Nếu thử lại: chỉ sửa est_wait_urgent (giữ normal = generic), bỏ term jumpers.
