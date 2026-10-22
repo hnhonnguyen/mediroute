@@ -633,3 +633,147 @@ Live seed 99 (fresh dir, speed 5000→clamp 60): finished t = 399.75 phút, 52/5
 **Verify độc lập (coordinator) — mở rộng 5 seeds:** cargo test 64/64; lặp quy trình chuẩn trên cả R8 (working tree) và R4 (worktree HEAD): fresh dir → live seed 99 → compare seeds 42/7/123/5/2024. Kết quả: R8 thua nhỏ ở seeds nhàn (42: +0.15 avg/+1.90 p90; 7: +0.33/+1.31; 2024: +0.83 avg nhưng p90 −1.76) nhưng thắng lớn ở seeds congested (123: −3.63/−5.44; **5: −0.72/−37.00**). Mean 5 seeds: avg_total 79.95→79.34 (−0.61), p90_total 143.39→135.19 (−8.20). Loại seed 5, mean 4 seeds vẫn tốt hơn cả hai metric.
 
 **Decision:** COMMIT — mean tốt hơn trên cả avg_total lẫn p90_total qua 5 seeds; cải thiện lớn nhất đúng vùng mục tiêu (high contention), regression chỉ ở seeds nhạn dưới 2.5% p90. Mô hình future congestion khắc phục đúng điểm mù được chẩn đoán ở Round 6 (wait decay về 0).
+
+---
+
+## Round 9 — Adaptive EWMA learning rate (chỉ learning, không đổi routing)
+
+**Status:** ❌ DISCARDED (negative end-to-end — không commit)
+
+**Aspect đề xuất:**
+- Learning hiện tại (từ Round 1) dùng EWMA **α = 0.3 cố định** cho mọi room, mọi lúc. Hệ quả kép:
+  - **Cold start chậm**: `est_service` khởi tạo từ seed config, lệch có chủ đích so với true mean (demo: config 10 phút, true mean 13 phút). Với α = 0.3, sau 5 mẫu estimate mới đạt ~12.50 (còn lệch 0.50); routing trong ~10–15 phút đầu dựa trên estimate sai.
+  - **Steady state nhiễu**: service sample dao động ±20% quanh true mean; α = 0.3 giữ estimate dao động theo từng sample, làm chi phí `est_service` trong cost function nhấp nhô và tạo route churn.
+- Đề xuất α thích ứng theo `visit_count` của từng room: **cao khi ít mẫu** (hội tụ nhanh từ cold start), **giảm dần khi nhiều mẫu** (giảm variance steady state):
+  `α(n) = max(α_min, α_init / (1 + n/k))`.
+- Chỉ đổi `learn.rs` (+ field diagnostic); **không đổi** router logic, congestion, sim physics, baselines, priority queue, API/JSON (chỉ thêm field additive vào room view) và frontend.
+
+**Thiết kế:**
+
+*`learn.rs`:*
+- `EwmaConfig { alpha_init, alpha_min, decay_k }`, default **0.7 / 0.1 / 10**; `alpha(n) = clamp(alpha_init/(1+n/k), alpha_min, alpha_init)`.
+  - Với default: `α(0)=0.70`, `α(1)=0.636`, `α(5)=0.467`, `α(10)=0.35`, `α(20)=0.233`, `α(36)=0.152`, `α(60)=0.10` (chạm floor), giữ `0.10` cho mọi `n ≥ 60`.
+  - α được áp dụng đồng thời cho `est_service_min`, `est_wait_observed_avg` và diagnostic mới.
+- `Learner` giữ `EwmaConfig`; `new()` dùng default, thêm `with_ewma()` (cho sweep/test) và `current_alpha(n)` (cho room view lúc idle).
+- Diagnostic **`avg_abs_service_dev_min`** = EWMA của `|service_sample − est trước khi update|`, dùng cùng α; chỉ để quan sát độ bất định, **không** tham gia routing/cost.
+- **Persistence tương thích**: field mới trong `RoomStats` có `#[serde(default)]`; `learning.json` cũ thiếu field load bình thường với giá trị 0, các field cũ (`est_service_min`, `est_wait_observed_avg`, `visit_count`) giữ nguyên, record kế tiếp tự cập nhật field mới. Không ghi đè/xoá data cũ.
+
+*`sim.rs` (additive view only):* `RoomView` thêm `learned_alpha` (α hiện tại theo `visit_count` của room) và `avg_abs_service_dev_min`. Không đổi logic mô phỏng.
+
+*Control:* `EwmaConfig { alpha_init: 0.3, alpha_min: 0.3, ... }` tái tạo **bit-identical** Round 8 ở live run và cả 3 seed compare → xác nhận routing/sim/baselines không bị đụng.
+
+**Sweep tham số** (mỗi combo fresh data dir, live seed 99 → compare 42/7/123; số là Optimized; 36 combo α_init ∈ {0.4,0.5,0.6,0.7} × α_min ∈ {0.1,0.15,0.2} × k ∈ {5,10,20}, cộng chẩn đoán ngoài range):
+
+| Config (α_init/α_min/k) | Live avg | Live p90 | Cmp mean avg | Cmp mean p90 | s42 avg | s7 avg | s123 avg |
+|---|---|---|---|---|---|---|---|
+| **R8 control α=0.3** | **78.01** | **146.60** | **69.83** | **107.45** | 64.07 | 73.13 | 72.29 |
+| 0.4 / 0.1 / 10 | 79.63 | 139.71 | 72.95 | 116.73 | 64.02 | 73.13 | 81.69 |
+| 0.5 / 0.1 / 5 | 79.63 | 139.71 | 72.13 | 112.98 | 64.02 | 73.13 | 79.23 |
+| 0.6 / 0.1 / 10 | 82.44 | 155.96 | 72.50 | 109.42 | 64.02 | 73.13 | 80.36 |
+| **0.7 / 0.1 / 10 (selected)** | 79.96 | 150.32 | 73.03 | 118.60 | 64.29 | 73.13 | 81.69 |
+| 0.7 / 0.1 / 20 | 81.07 | 149.27 | 72.52 | 109.42 | 64.07 | 73.13 | 80.36 |
+| 0.7 / 0.2 / 10 | 79.96 | 150.32 | 72.96 | 116.73 | 64.07 | 73.13 | 81.69 |
+| diagnostic 0.7 / 0.3 / 5 | 79.96 | 150.32 | 69.83 | 107.45 | 64.07 | 73.13 | 72.29 |
+
+- **Không combo nào trong range cải thiện compare mean**: tốt nhất avg_total là 72.13 (0.5/0.1/5), tốt nhất p90_total là 109.42 (0.6/0.1/10 và 0.7/0.1/20) — đều kém R8 (69.83 / 107.45). Regression tập trung ở **seed 123** (79.2–81.7 vs 72.29); seed 42/7 gần như đứng yên.
+- Chẩn đoán `α_min = 0.3, k = 5` (ngoài range yêu cầu) **trùng khít R8 ở compare** vì sau live mỗi room đã có 14–36 visits → `α(n) = 0.3` đúng bằng fixed alpha trong suốt compare. Đây là bằng chứng cơ chế: lợi ích của adaptive chỉ xuất hiện khi learning thực sự cold; khi đã warm, α thấp hơn 0.3 làm estimate bám chậm hơn vào sample stream của seed mới.
+- Chọn **0.7 / 0.1 / 10** làm cấu hình đại diện: nằm trong range, α_init cao nhất (cold start nhanh nhất), có cold-compare tốt nhất trong các combo cùng range (xem dưới), và minh hoạ rõ nhất trade-off cold vs warm.
+
+**Cold-start quality (synthetic + live):**
+
+| Kiểm chứng | Adaptive 0.7/0.1/10 | Fixed 0.3 | Nhận xét |
+|---|---|---|---|
+| 5 samples seed 10 → 13 (estimate) | 12.9685 (lệch 0.0315) | 12.4958 (lệch 0.5040) | adaptive lệch **16× nhỏ hơn** |
+| Variance steady state (500 estimate, n≥300, sample ±20%) | 0.1006 | 0.3483 | adaptive **~3.5× thấp hơn** |
+| Live seed 99: thời điểm MAE < 1.0 | t = 54.0 | t = 78.0 | sớm hơn 24 phút |
+| Live seed 99: thời điểm MAE < 0.75 | t = 78.0 | t = 90.0 | sớm hơn 12 phút |
+| Live seed 99: MAE cuối run | 0.459 | 0.427 | nhỉnh hơn 0.03 (xem phân tích) |
+
+MAE cuối run của adaptive không thấp hơn vì live chỉ có 16–36 visits/room: điểm estimate cuối chịu finite-sample noise của seed nhiều hơn là variance; lợi thế variance chỉ hiện rõ ở chuỗi dài (test synthetic 800 samples).
+
+**Kết quả live run seed 99 (fresh dir, speed 5000, cold start thực sự):**
+
+| Metric | R8 (α=0.3) | Round 9 (0.7/0.1/10) | Δ |
+|---|---|---|---|
+| avg_total | 78.01 | 79.96 | +1.95 (+2.50%) |
+| avg_wait | 6.61 | 7.13 | +0.52 (+7.87%) |
+| p90_total | 146.60 | 150.32 | +3.72 (+2.54%) |
+| p90_wait | 16.47 | 23.02 | +6.55 (+39.8%) |
+| avg_walk | 11.05 | 11.10 | +0.05 (+0.45%) |
+| finished (sim time) | 399.75 | 392.21 | −7.54 phút |
+| final MAE | 0.427 | 0.459 | +0.032 |
+
+Live: 52/52, 188 visits, urgent 5.00/10.25, normal 7.29/23.26 (avg/p90 wait). Adaptive hội tụ estimate nhanh hơn ở giai đoạn đầu nhưng **live metrics xấu hơn**, chủ yếu ở p90_wait: α cao thời kỳ đầu bám theo từng service sample ±20% (nhiễu, không phải tín hiệu), làm thứ hạng phòng đổi sớm và đẩy tail của nhóm normal lên (p90_wait normal 23.26 vs 14.59 của R8), dù nhóm urgent lại tốt hơn (5.00 vs 5.42).
+
+**Compare 3 seeds — đúng quy trình verify (live seed 99 trước, rồi compare):**
+
+Seed 42:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized (R9)** | 64.29 | 3.03 | 83.40 | 11.32 |
+| Optimized (R8) | 64.07 | 2.91 | 77.79 | 11.51 |
+| FixedOrder | 77.02 | 5.91 | 130.21 | 13.45 |
+| ShortestQueue | 71.32 | 4.33 | 103.89 | 13.57 |
+
+Seed 7:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized (R9)** | 73.13 | 4.68 | 128.20 | 11.76 |
+| Optimized (R8) | 73.13 | 4.68 | 128.20 | 11.76 |
+| FixedOrder | 84.39 | 7.08 | 138.89 | 13.82 |
+| ShortestQueue | 77.82 | 5.56 | 139.75 | 13.10 |
+
+Seed 123:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| **Optimized (R9)** | 81.69 | 9.45 | 144.21 | 10.45 |
+| Optimized (R8) | 72.29 | 6.60 | 116.37 | 10.81 |
+| FixedOrder | 86.44 | 10.17 | 145.23 | 12.73 |
+| ShortestQueue | 81.09 | 8.67 | 126.75 | 12.49 |
+
+Mean 3 seed Optimized: **73.04 / 5.72 / 118.60 / 11.18** vs R8 **69.83 / 4.73 / 107.45 / 11.36** → avg_total **+3.21 (+4.59%)**, avg_wait +0.99 (+20.9%), p90_total **+11.15 (+10.38%)**, avg_walk −0.18 (−1.62%). Baselines khớp **từng số** với R8 ở cả 3 seed × 4 metric (77.0249/5.9134/130.2068/13.4523; 71.3185/4.3273/103.8948/13.5720; 84.3898/7.0846/138.8932/13.8233; 77.8194/5.5577/139.7541/13.0962; 86.4409/10.1679/145.2265/12.7288; 81.0868/8.6726/126.7505/12.4931) → physics/seed/baseline routing không đổi.
+
+**Compare cold (fresh dir, không live warm-up) — nơi adaptive thực sự có đất:**
+
+| Config | Mean avg_total | Mean p90_total | s42 avg/p90 | s7 avg/p90 | s123 avg/p90 |
+|---|---|---|---|---|---|
+| R8 control α=0.3 | 73.00 | 116.88 | 64.07 / 77.79 | 73.09 / 128.65 | 81.82 / 144.21 |
+| **0.7 / 0.1 / 10** | **71.05** | **109.30** | 64.07 / 77.79 | 73.17 / 128.20 | **75.92 / 121.92** |
+| diagnostic 0.7 / 0.3 / 5 | 71.09 | 109.34 | 64.07 / 77.79 | 73.27 / 128.30 | 75.92 / 121.92 |
+
+Cold compare: mean avg_total −1.94 (−2.66%), p90_total −7.58 (−6.49%); seed 123 −7.21% avg / −15.46% p90, seed 42/7 trung tính. Tức adaptive giúp đúng như kỳ vọng khi learning bắt đầu từ zero, nhưng **quy trình verify chuẩn (live seed 99 trước) đã warm-start compare** nên lợi ích này bị che khuất, trong khi nhược điểm α thấp ở n≥14 lại lộ ra.
+
+**Phân tích cold-start vs steady-state:**
+- **Cold** (n = 0–10): α 0.7 → 0.35 hội tụ nhanh, estimate sát true mean sớm hơn hẳn; synthetic 16× và cold compare −6.5% p90 xác nhận.
+- **Warm** (n = 14–36 sau live): α(n) = 0.15–0.29 < 0.3. Compare chỉ 52 patients/188 visits, đủ ngắn để estimate "bám" trạng thái warm; α thấp làm chậm việc hiệu chỉnh theo realized sample mean của seed compare. Route ranking đổi → seed 123 xấu đi mạnh. Diagnostic floor 0.3 tie R8 chứng minh đây là nguyên nhân, không phải lỗi routing.
+- **Live**: α cao đầu run phản ứng với service noise ±20% (sample variance, không phải drift), gây churn; estimate accuracy vốn không phải nút cổ chai của routing (R8 đã đủ tốt), nên hội tụ nhanh hơn không chuyển thành metric tốt hơn.
+- **Steady state variance**: mục tiêu (b) đạt trong test synthetic dài (3.5× thấp hơn), nhưng trong run 52 bệnh nhân lợi ích này chưa đủ bù tác động của việc giảm responsiveness lên route decisions.
+
+**Files changed:** `backend/src/domain.rs` (`RoomStats.avg_abs_service_dev_min` + `#[serde(default)]`), `backend/src/engine/learn.rs` (`EwmaConfig`, α thích ứng, diagnostic EWMA, `with_ewma`/`current_alpha`, 4 test mới), `backend/src/engine/sim.rs` (`RoomView` thêm `learned_alpha` + `avg_abs_service_dev_min`), `backend/src/engine/router.rs` (chỉ test literal thêm field, không đổi logic), `docs/rounds/README.md`. Không đổi router/congestion logic, sim physics, baselines, priority queue, API contract cũ, frontend. Sweep dùng env override tạm thời; **đã gỡ**, code cuối hard-code 0.7/0.1/10.
+
+**Verify steps:**
+1. `cargo test`: **68/68 pass** (64 test cũ + 4 mới: α giảm từ init chạm floor đúng tại n = 60; hội tụ 5 mẫu nhanh hơn fixed 0.3 ≥ 40%; variance steady state < 80% fixed; legacy snapshot thiếu field mới load được, default 0, record kế tiếp upgrade đúng; test persistence cũ cập nhật kỳ vọng theo α(0)=0.7 và kiểm tra diagnostic).
+2. `npm run build`: OK (frontend không đổi; chỉ warning chunk > 500 kB có từ trước).
+3. Fresh `MEDIROUTE_DATA_DIR=/tmp/mediroute-r9-test`, server riêng `PORT=8082`; live `{strategy:optimized, speed:5000, seed:99}` → finished 392.21 phút, 52/52, 188 visits.
+4. `POST /api/sim/compare` seed 42 → 7 → 123; baselines khớp R8 từng số; control fixed α=0.3 tái tạo R8 bit-identical.
+5. Sweep 36 combo + 14 chẩn đoán (mỗi combo fresh dir `/tmp/mediroute-r9-sweep/*`), thêm cold compare không live warm-up.
+6. Legacy `backend/data/learning.json` thật: server load không warning, stats giữ nguyên, field mới = 0, `learned_alpha` xuất hiện trong `/api/rooms`.
+7. Port 8080 không đụng; không git commit/push.
+
+**Đánh giá vs Round 8:**
+- (a) Cold-start convergence: **đạt** — synthetic 16× gần hơn sau 5 mẫu; live MAE < 1 sớm hơn 24 phút, MAE < 0.75 sớm hơn 12 phút; cold compare mean −2.66% avg_total / −6.49% p90_total.
+- (b) Steady-state variance: **đạt trên chuỗi dài** — 0.1006 vs 0.3483 (~3.5× thấp hơn) ở test 800 samples.
+- (c) End-to-end theo quy trình verify: **KHÔNG đạt** — live +2.50% avg_total / +2.54% p90_total / +39.8% p90_wait; compare sau live +4.59% avg_total / +10.38% p90_total, regression nặng ở seed 123 (+13.0% avg / +23.9% p90). Không seed nào cải thiện, baselines không đổi.
+
+**Decision:** **KHÔNG COMMIT** — thất bại tiêu chí end-to-end dù đạt (a) và (b). Working tree giữ code + docs để coordinator verify độc lập; không có thay đổi nào được commit.
+
+**Bài học:** α thích ứng là giải pháp đúng cho *cold start* nhưng quy trình verify (live warm-up trước compare) biến phần lớn learning thành warm, nơi α thấp hơn 0.3 chỉ làm estimate bám seed mới chậm hơn. Bài toán thực sự không phải "estimate hội tụ nhanh" mà là "route ranking ổn định dưới noise ±20% khi đã có đủ mẫu". Hướng tiếp theo hợp lý: chỉ áp α init cao cho room **chưa từng có snapshot** (visit_count = 0 trong persisted stats) và giữ α = 0.3 cho room đã warm; hoặc dùng diagnostic `avg_abs_service_dev_min` để phát hiện drift thật rồi mới tăng α, thay vì tăng α máy móc theo n nhỏ. Cả hai đều cần đo lại vì live cold start vẫn có thể churn như đã thấy ở Round 9.
+
+**Verify độc lập (coordinator):** cargo test 68/68; lặp quy trình chuẩn (fresh dir → live seed 99 → compare seed 123): khớp chính xác (81.69/144.21 — regression vs R8 72.29/116.37, p90 thậm chí tệ hơn ShortestQueue 126.75). Code reverted, cargo test 64/64.
+
+**Decision:** DISCARD — regression end-to-end rõ rệt sau warm-up (+4.59% avg, +10.38% p90 mean 3 seeds). Control α=0.3 của agent tái tạo R8 bit-identical, xác nhận nguyên nhân nhân quả.
+
+**Bài học:** α adaptive chỉ thắng ở cold-start thuần (first-run MAE tốt hơn 16×) nhưng trong quy trình có warm-up, α thấp khi warm làm estimate bám dịch chậm — service mean không đổi trong ngày nên tracking nhanh hơn không mang lợi, chỉ mang noise. α = 0.3 cố định là điểm cân bằng tốt cho workload tĩnh.
