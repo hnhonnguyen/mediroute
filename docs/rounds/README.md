@@ -895,3 +895,115 @@ Live seed 99 (fresh dir, speed 5000): finished `t = 399.74754874492817` phút, 5
 **Verify độc lập (coordinator):** cargo test 74/74; lặp quy trình chuẩn (fresh dir → live seed 99 → compare 42/7/123): khớp chính xác — seed 7 cải thiện 73.13→72.23 avg_total / 4.68→4.42 avg_wait; seeds 42/123 giữ nguyên từng số; baselines không đổi.
 
 **Decision:** COMMIT — mean avg_total −0.43%, không regression per-seed, và sửa đúng mô hình: wait giờ được đánh giá tại thời điểm patient dự kiến TỚI (downtime kết thúc trước arrival không còn bị phạt), risk Bayesian hậu nghiệm chỉ dùng tie-break muộn.
+
+---
+
+## Round 11 — Thống nhất anti-herding với λ-model (chỉ Optimized)
+
+**Status:** ⚠️ KHÔNG COMMIT — regression so với R10, báo cáo trung thực theo yêu cầu round.
+
+**Aspect đề xuất:**
+- HEAD (R10) có **hai mô hình competitor song song**:
+  - (a) heuristic likely-arrivals kiểu Round 1: chiếu từng bệnh nhân đang trong hệ thống sang các phòng kế tiếp với weight `1/|eligible|`, dùng trong predictive wait (`room_loads` → `est_wait_min`);
+  - (b) λ-model `ArrivalDemand` (R8): tốc độ arrival theo segment × `share(room)`, dùng trong lookahead `future_wait_min`.
+- Hệ quả: predictive path ước lượng competitor rời rạc theo từng bệnh nhân, không biết λ; lookahead cộng cả λ lẫn likely arrivals. Trong rush, hai mô hình có thể over/under-count không nhất quán.
+- Round 11 yêu cầu: thay heuristic trong predictive wait bằng λ-model `E_r(now, now+horizon)`, horizon = thời gian bệnh nhân dự kiến tới + wait; λ=0 → không competitor ảo; sau thay thế chỉ còn **một nguồn estimate** (ArrivalDemand); queue/pending/en-route vẫn là facts đếm đủ; chỉ Optimized đổi.
+
+**Thiết kế:**
+
+*Predictive wait (`congestion.rs::est_wait_with_demand_min`):*
+- Không có demand (context cũ/test) → fallback `est_wait_min` như trước.
+- Có demand:
+  - `base = projected_wait(load, service, capacity, 0)` — wait do committed load;
+  - `horizon = walk + base` — thời điểm bệnh nhân dự kiến bắt đầu service;
+  - dựng station free-times từ `in_service_remaining`, floor `downtime_remaining_min`;
+  - đổ `pending_starts + queue_len + en_route` jobs tại ready 0, full weight — **facts, anti-herding giữ nguyên như trước**;
+  - cộng λ arrivals theo từng slice 1 phút trong `[now, now+horizon]`: work = `service × E_r(slice) × scale`, ready tại đúng phút arrival;
+  - trả station free sớm nhất = wait dự kiến.
+- λ=0 (lull 120–150, sau 210) → không thêm job nào → wait chỉ còn committed load, **không phantom competitor**.
+- Competitor tỷ lệ thuận `share(room)` vì `E_r` tuyến tính theo share.
+- `wait_at`: phòng đang downtime giữ nguyên đường R10 `est_wait_at_arrival_min`; còn lại dùng hàm mới với `PREDICTIVE_DEMAND_SCALE` = **0.8**.
+
+*Một nguồn estimate (`future_wait_min`):*
+- Khi có demand, lookahead chỉ dùng λ; `likely_arrivals` chỉ còn là fallback khi `demand = None`. R10 cộng cả hai (tác giả R10 lập luận không double-count vì likely arrivals là bệnh nhân đã ở trong hệ thống, không nằm trong λ), nhưng yêu cầu round là sau thay thế chỉ còn một nguồn nên đã bỏ.
+- `sim.rs::room_loads` bỏ hẳn `add_likely_arrivals` và map `in_service_remaining`; chỉ còn facts: `queue_len`, `pending_starts`, `in_service`, `in_service_remaining`, `en_route`, downtime. Không đổi RNG, physics, priority queue, learning.
+
+**Sweep scale (mean 3 seed 42/7/123, compare trên fresh dir + live seed 99):**
+
+| Scale | s42 avg/p90 | s7 avg/p90 | s123 avg/p90 | Mean avg | Mean p90 | Live s99 avg/wait/p90 |
+|---|---|---|---|---|---|---|
+| 0.4 (diagnostic) | 64.74/84.15 | 76.42/128.34 | 78.63/129.42 | 73.26 | 113.97 | 81.82/7.66/148.94 |
+| 0.6 (diagnostic) | 64.63/82.17 | 74.95/131.72 | 81.38/132.18 | 73.66 | 115.36 | 79.97/7.10/150.19 |
+| **0.8 (chọn)** | **64.11/76.44** | **75.35/130.37** | **77.57/132.18** | **72.34** | **113.00** | **80.87/7.33/139.06** |
+| 1.0 | 64.09/76.38 | 73.75/131.02 | 82.61/144.18 | 73.48 | 117.19 | 84.05/8.22/163.81 |
+| 1.2 | 64.87/83.26 | 73.75/129.67 | 79.89/127.55 | 72.83 | 113.49 | 83.75/8.06/163.81 |
+| R10 (ref) | 64.07/77.79 | 72.23/128.20 | 72.29/116.37 | 69.53 | 107.45 | 78.01/6.61/146.60 |
+
+- 0.8 thắng cả mean avg (72.34) lẫn mean p90 (113.00) trong sweep; 0.4/0.6 là diagnostic mở rộng ngoài bộ 0.8/1.0/1.2 được yêu cầu, xác nhận regression không phải do calibration. Không có xu hướng đơn điệu theo scale → vấn đề là **mất thông tin**, không phải hệ số.
+
+**Kết quả compare scale 0.8 (verify chuẩn: fresh dir → live seed 99 → compare 42/7/123):**
+
+Seed 42:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| Optimized (R11) | 64.11 | 2.95 | 76.44 | 11.41 |
+| Optimized (R10) | 64.07 | 2.91 | 77.79 | 11.51 |
+| FixedOrder | 77.02 | 5.91 | 130.21 | 13.45 |
+| ShortestQueue | 71.32 | 4.33 | 103.89 | 13.57 |
+
+Seed 7:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| Optimized (R11) | 75.35 | 5.20 | 130.37 | 11.99 |
+| Optimized (R10) | 72.23 | 4.42 | 128.20 | 11.85 |
+| FixedOrder | 84.39 | 7.08 | 138.89 | 13.82 |
+| ShortestQueue | 77.82 | 5.56 | 139.75 | 13.10 |
+
+Seed 123:
+
+| Strategy | avg_total | avg_wait | p90_total | avg_walk |
+|---|---|---|---|---|
+| Optimized (R11) | 77.57 | 8.19 | 132.18 | 10.64 |
+| Optimized (R10) | 72.29 | 6.60 | 116.37 | 10.81 |
+| FixedOrder | 86.44 | 10.17 | 145.23 | 12.73 |
+| ShortestQueue | 81.09 | 8.67 | 126.75 | 12.49 |
+
+**Đánh giá vs Round 10 (Optimized, mean 3 seed):**
+
+| Metric | R10 | R11 (0.8) | Δ |
+|---|---|---|---|
+| avg_total | 69.53 | 72.34 | **+2.81 (+4.04%)** |
+| avg_wait | 4.64 | 5.45 | **+0.80 (+17.3%)** |
+| p90_total | 107.45 | 113.00 | **+5.55 (+5.16%)** |
+| avg_walk | 11.39 | 11.35 | −0.04 (−0.36%) |
+
+- Tệ hơn R10 ở **cả hai** tiêu chí bắt buộc (avg_total và p90_total). Per-seed avg_total đều tệ hơn: s42 +0.04, s7 +3.13, s123 +5.27. p90 chỉ tốt hơn ở s42 (−1.34), tệ hơn s7 (+2.17) và s123 (+15.82).
+- Live seed 99: 80.87/7.33/139.06/11.28 (t = 408.37 phút) vs R10 78.01/6.61/146.60/11.05 — avg tệ hơn 2.86, p90 tốt hơn 7.54; không đủ bù cho mean compare.
+- Baselines khớp **từng số** với R10 ở cả 3 seed × 4 metric: FixedOrder 77.0249/5.9134/130.2068/13.4523; 84.3898/7.0846/138.8932/13.8233; 86.4409/10.1679/145.2265/12.7288. ShortestQueue 71.3185/4.3273/103.8948/13.5720; 77.8194/5.5577/139.7541/13.0962; 81.0868/8.6726/126.7505/12.4931.
+
+**Nguyên nhân regression (trung thực):**
+- Mô hình thống nhất bỏ **in-system cross-room projections** khỏi lookahead: λ chỉ biết arrival từ ngoài, không biết các bệnh nhân đang trong hệ thống sẽ tràn vào phòng nào trong vài chục phút tới. Khi nhiều bệnh nhân đã vào (giữa rush), lookahead under-predict congestion tại các phòng hot → Optimized herd vào đó mạnh hơn; s123 là ca rõ nhất (avg_wait 6.60 → 8.19, p90 116.37 → 132.18).
+- Predictive λ trong lúc walk có thể over-charge phòng hot giữa peak, nhưng avg_walk gần như không đổi (11.39 → 11.35), nên tổn thất chính nằm ở phía lookahead.
+- Scale không cứu được: 0.4/0.6/0.8/1.0/1.2 đều thua R10 mean; 0.8 chỉ là điểm tốt nhất trong các điểm đã thử. Giữ likely arrivals trong lookahead song song với λ predictive có khả năng phục hồi phần lớn, nhưng vi phạm yêu cầu "chỉ còn một nguồn", nên không làm.
+
+**Files changed:** `backend/src/engine/congestion.rs` (`est_wait_with_demand_min`, `station_free_times` refactor dùng chung, `future_wait_min` single-source; 4 test mới), `backend/src/engine/router.rs` (`PREDICTIVE_DEMAND_SCALE = 0.8`, `wait_at` λ path cho phòng không downtime, giữ nguyên downtime path R10; 1 test mới), `backend/src/engine/sim.rs` (bỏ heuristic + map `in_service_remaining`, `room_loads()` facts-only, bỏ import không dùng; 1 test mới), `docs/rounds/README.md`. Không đổi FixedOrder/ShortestQueue, cơ chế sim, API/JSON, frontend, learning, downtime handling R10.
+
+**Verify steps:**
+1. `cargo test`: **80/80 pass** (74 test cũ + 6 mới: 4 congestion — rush > lull cùng load, λ=0 không phantom, competitor tỷ lệ share (ratio 9.0 chính xác), không double-count với legacy likely weights/future_wait; 1 sim — `room_loads` chỉ facts; 1 router — predictive wait theo demand, baselines giữ nguyên lựa chọn).
+2. `npm run build`: OK (frontend không đổi; chỉ warning chunk > 500 kB có từ trước).
+3. Fresh `MEDIROUTE_DATA_DIR=/tmp/mediroute-r11-test`, server riêng `PORT=8082`; live `{strategy:optimized, speed:5000, seed:99}` → finished `t = 408.3704369444138` phút, 52/52, 80.8696/7.3316/139.0584/11.2799.
+4. `POST /api/sim/compare` seed 42 → 7 → 123; ghi đủ 4 metric; baselines khớp R10 từng số.
+5. Sweep fresh dir riêng cho từng scale 0.4/0.6/0.8/1.0/1.2; 0.8 được chọn.
+6. Port 8080 không đụng; **không git commit/push**.
+
+**Decision:** **KHÔNG COMMIT** — không đạt tiêu chí "tốt hơn R10 trên avg_total hoặc p90_total (mean)". Working tree giữ code + docs để coordinator verify độc lập.
+
+**Bài học:** λ-model là mô hình tốt cho arrival từ ngoài nhưng **không thay thế được** projection của bệnh nhân đã ở trong hệ thống; hai nguồn này bổ sung cho nhau chứ không phải hai cách ước lượng cùng một đại lượng. Ép về một nguồn λ làm mất tín hiệu "phòng hot sắp bị tràn bởi chính các bệnh nhân đang trong nhà", và anti-herding mất tác dụng đúng lúc cần nhất (giữa rush, khi queue đã hình thành ở các phòng khác). Bài học tổng quát: trước khi thống nhất hai mô hình, phải xác định chúng có cùng support hay không; nếu support khác nhau (external arrivals vs in-system routing), "một nguồn" là mất mát thông tin chứ không phải khử trùng lặp.
+
+**Verify độc lập (coordinator):** cargo test 80/80; lặp quy trình chuẩn (fresh dir → live seed 99 → compare seed 123): khớp chính xác (77.57/132.18 — regression vs R10 72.29/116.37). Code reverted, cargo test 74/74.
+
+**Decision:** DISCARD — mean avg_total +2.81, p90 +5.55; không scale nào (0.4–1.2) tốt hơn R10.
+
+**Bài học:** heuristic anti-herding cũ không trùng lặp λ — nó projection hành vi của patients ĐÃ Ở TRONG hệ thống (in-process routing decisions), thứ λ không biết (λ chỉ mô hình arrivals từ ngoài). Thay thế = mất thông tin, không phải dedupe. Kết luận kiến trúc: 2 nguồn competitor là bổ sung: λ cho arrivals tương lai, heuristic cho internal patients; nếu tinh chỉnh sau này thì phải cộng cả hai.
